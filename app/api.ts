@@ -17,6 +17,7 @@ export type JobSummary = {
   signal: number;
   workflows: string[];
   preview_available: boolean;
+  source_available: boolean;
   preview_tone: number;
   preferred_batch_size?: number;
   failure_summary?: string | null;
@@ -49,7 +50,7 @@ export type FrameModel = {
   name: string;
   short: string;
   color: string;
-  kind: "box" | "vehicle" | "segment";
+  kind: "box" | "vehicle" | "segment" | "people" | "group";
   status: string;
   classes: string[];
   annotations: Annotation[];
@@ -57,6 +58,9 @@ export type FrameModel = {
   /** Legacy single-segment field kept for older API responses. */
   segment: Segment | null;
   count: number;
+  people_count?: number;
+  group_count?: number;
+  grouped_people_count?: number;
 };
 
 export type FrameReview = {

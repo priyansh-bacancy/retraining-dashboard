@@ -168,7 +168,7 @@ function JobsLanding({
 
   const displayedJobs = useMemo(
     () =>
-      reviewableOnly ? jobs.filter((job) => job.successful_models > 0) : jobs,
+      reviewableOnly ? jobs.filter((job) => job.source_available) : jobs,
     [jobs, reviewableOnly],
   );
   const totals = useMemo(
@@ -177,9 +177,9 @@ function JobsLanding({
         (sum, job) => sum + job.successful_models,
         0,
       ),
-      reviewable: displayedJobs.filter((job) => job.successful_models > 0)
+      reviewable: displayedJobs.filter((job) => job.source_available)
         .length,
-      failed: displayedJobs.filter((job) => job.successful_models === 0).length,
+      failed: displayedJobs.filter((job) => !job.source_available).length,
     }),
     [displayedJobs],
   );
@@ -332,7 +332,7 @@ function JobsLanding({
               <AlertTriangle size={19} />
             </span>
             <div>
-              <small>Unavailable jobs</small>
+              <small>Source unavailable</small>
               <strong>{loading ? "—" : totals.failed}</strong>
               <p>On this page</p>
             </div>
@@ -410,7 +410,7 @@ function JobsLanding({
                           : undefined
                       }
                     >
-                      <Video size={17} />
+                      {!job.preview_available && <Video size={17} />}
                       <span>{job.status}</span>
                     </i>
                     <span>
@@ -461,9 +461,14 @@ function JobsLanding({
                         Review
                         <ArrowRight size={15} />
                       </>
+                    ) : job.source_available ? (
+                      <>
+                        Manual review
+                        <ArrowRight size={15} />
+                      </>
                     ) : (
                       <>
-                        Unavailable
+                        Source unavailable
                         <AlertTriangle size={14} />
                       </>
                     )}

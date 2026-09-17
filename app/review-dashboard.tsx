@@ -56,6 +56,7 @@ type DragMode = "move" | "nw" | "ne" | "sw" | "se";
 type FrameDraft = {
   annotations: Annotation[];
   dirtyModels: string[];
+  peopleCounts: Record<string, number>;
   segments: Segment[];
 };
 type PendingNavigation = { run: () => void } | null;
@@ -92,7 +93,23 @@ function defaultModelId(models: VisibleModel[]) {
 function kindLabel(kind: FrameModel["kind"]) {
   if (kind === "segment") return "Time segment";
   if (kind === "vehicle") return "Track + attributes";
+  if (kind === "people") return "People count";
+  if (kind === "group") return "Groups + people count";
   return "Bounding box";
+}
+
+function peopleInGroup(annotation: Annotation) {
+  const value = annotation.attributes?.people_count;
+  if (value === undefined || value === null || value === "") return null;
+  const count = Number(value);
+  return Number.isInteger(count) && count >= 0 ? count : null;
+}
+
+function groupPeopleTotal(items: Annotation[]) {
+  const counts = items.map(peopleInGroup);
+  return counts.length > 0 && counts.every((count) => count !== null)
+    ? (counts as number[]).reduce((total, count) => total + count, 0)
+    : null;
 }
 
 export function ReviewDashboard({
@@ -167,8 +184,8 @@ export function ReviewDashboard({
     const matchesFilter =
       jobFilter === "all" ||
       (jobFilter === "reviewable"
-        ? item.successful_models > 0
-        : item.successful_models === 0);
+        ? item.source_available
+        : !item.source_available);
     return matchesQuery && matchesFilter;
   });
   const selected = annotations.find((item) => item.id === selectedId);
@@ -301,6 +318,12 @@ export function ReviewDashboard({
         visible,
         annotations: modelAnnotations,
         count: modelAnnotations.length,
+        people_count:
+          model.kind === "people"
+            ? (draft.peopleCounts[model.id] ??
+              model.people_count ??
+              modelAnnotations.length)
+            : model.people_count,
       };
     });
     setCurrentFrameIndex(index);
@@ -416,6 +439,7 @@ export function ReviewDashboard({
       .catch((caught) => {
         if (!cancelled) {
           setPreparingBatch(false);
+          setImageLoading(false);
           setError(
             caught instanceof Error
               ? caught.message
@@ -613,7 +637,17 @@ export function ReviewDashboard({
     setModels((items) =>
       items.map((item) =>
         item.id === selected.model_id
-          ? { ...item, count: Math.max(0, item.count - 1) }
+          ? {
+              ...item,
+              count: Math.max(0, item.count - 1),
+              people_count:
+                item.kind === "people"
+                  ? Math.max(
+                      Math.max(0, item.count - 1),
+                      Math.max(0, (item.people_count ?? item.count) - 1),
+                    )
+                  : item.people_count,
+            }
           : item,
       ),
     );
@@ -626,7 +660,15 @@ export function ReviewDashboard({
       items.filter((item) => item.model_id !== modelId),
     );
     setModels((items) =>
-      items.map((item) => (item.id === modelId ? { ...item, count: 0 } : item)),
+      items.map((item) =>
+        item.id === modelId
+          ? {
+              ...item,
+              count: 0,
+              people_count: item.kind === "people" ? 0 : item.people_count,
+            }
+          : item,
+      ),
     );
     if (selected?.model_id === modelId) setSelectedId("");
     markDirty(modelId);
@@ -650,7 +692,16 @@ export function ReviewDashboard({
     setAnnotations((items) => [...items, annotation]);
     setModels((items) =>
       items.map((item) =>
-        item.id === activeLayer.id ? { ...item, count: item.count + 1 } : item,
+        item.id === activeLayer.id
+          ? {
+              ...item,
+              count: item.count + 1,
+              people_count:
+                item.kind === "people"
+                  ? Math.max(item.people_count ?? item.count, item.count + 1)
+                  : item.people_count,
+            }
+          : item,
       ),
     );
     setSelectedId(annotation.id);
@@ -800,6 +851,15 @@ export function ReviewDashboard({
     return {
       annotations: annotations.map((item) => ({ ...item })),
       dirtyModels: [...dirtyModels],
+      peopleCounts: Object.fromEntries(
+        models
+          .filter((model) => model.kind === "people")
+          .map((model) => [
+            model.id,
+            model.people_count ??
+              annotations.filter((item) => item.model_id === model.id).length,
+          ]),
+      ),
       segments: activeSegments.map((segment) => ({ ...segment })),
     };
   }
@@ -890,6 +950,10 @@ export function ReviewDashboard({
                   track_id: item.track_id,
                   attributes: item.attributes,
                 })),
+              people_count:
+                model?.kind === "people"
+                  ? draft.peopleCounts[modelId]
+                  : undefined,
               segments:
                 model?.kind === "segment" || modelId.includes("aggression")
                   ? draft.segments
@@ -954,6 +1018,11 @@ export function ReviewDashboard({
                     ...model,
                     annotations: modelAnnotations,
                     count: modelAnnotations.length,
+                    people_count:
+                      model.kind === "people"
+                        ? (draft.peopleCounts[model.id] ??
+                          modelAnnotations.length)
+                        : model.people_count,
                   };
                 }),
               };
@@ -1013,8 +1082,8 @@ export function ReviewDashboard({
             <p className="eyebrow">Preparing annotation workspace</p>
             <h1>Loading the selected video job</h1>
             <p>
-              The source video is downloaded once and all 20 frames in this
-              batch are prepared for smooth review.
+              The source video is downloaded once and the requested frame
+              batch is prepared for smooth review.
             </p>
             <div className="loader-job">
               <Cloud size={15} />
@@ -1180,7 +1249,9 @@ export function ReviewDashboard({
                   >
                     {item.successful_models
                       ? `${item.signal} detections`
-                      : "No model output"}
+                      : item.source_available
+                        ? "Manual review"
+                        : "Source unavailable"}
                   </span>
                 </div>
               </button>
@@ -1351,7 +1422,7 @@ export function ReviewDashboard({
                     }}
                   />
                 )}
-                {imageLoading && (
+                {imageLoading && currentFrame && imageUrl && (
                   <div className="frame-loading-overlay">
                     <LoaderCircle className="spin" size={25} />
                     <strong>
@@ -1359,6 +1430,16 @@ export function ReviewDashboard({
                         ? "Preparing all frames in this batch"
                         : "Preparing this frame"}
                     </strong>
+                  </div>
+                )}
+                {!imageLoading && !currentFrame && (
+                  <div className="frame-unavailable-overlay">
+                    <AlertTriangle size={25} />
+                    <strong>Source frames are unavailable</strong>
+                    <span>
+                      This job has no resolvable source video. A source must be
+                      attached before manual annotations can be created.
+                    </span>
                   </div>
                 )}
                 <div className="camera-label">
@@ -1402,7 +1483,11 @@ export function ReviewDashboard({
                             className="annotation-label"
                             style={{ background: model.color }}
                           >
-                            {model.short} · {annotation.label}{" "}
+                            {model.short} · {annotation.label}
+                            {model.kind === "group" &&
+                            peopleInGroup(annotation) !== null
+                              ? ` · ${peopleInGroup(annotation)} people`
+                              : ""}{" "}
                             <b>{Math.round(annotation.confidence * 100)}%</b>
                           </span>
                           {selectedId === annotation.id && (
@@ -1644,52 +1729,74 @@ export function ReviewDashboard({
                   <div className="section-heading">
                     <div>
                       <p className="eyebrow">Live layers</p>
-                      <h3>Successful models on this frame</h3>
+                      <h3>Model layers on this frame</h3>
                     </div>
                     <button className="text-button" onClick={showAllModels}>
                       Show all
                     </button>
                   </div>
                   <div className="model-list">
-                    {models.map((model) => (
-                      <div
-                        key={model.id}
-                        className={`model-row ${activeModel === model.id ? "model-row-active" : ""}`}
-                      >
-                        <button
-                          className="model-select"
-                          onClick={() => setActiveModel(model.id)}
+                    {models.map((model) => {
+                      const layerAnnotations = annotations.filter(
+                        (annotation) => annotation.model_id === model.id,
+                      );
+                      const groupedPeople = groupPeopleTotal(layerAnnotations);
+                      const semanticSummary =
+                        model.kind === "people"
+                          ? `${model.people_count ?? layerAnnotations.length} ${(model.people_count ?? layerAnnotations.length) === 1 ? "person" : "people"}`
+                          : model.kind === "group"
+                            ? `${layerAnnotations.length} ${layerAnnotations.length === 1 ? "group" : "groups"} · ${groupedPeople ?? "—"} people`
+                            : kindLabel(model.kind);
+                      return (
+                        <div
+                          key={model.id}
+                          className={`model-row ${activeModel === model.id ? "model-row-active" : ""}`}
                         >
-                          <span
-                            className="model-dot"
-                            style={{ background: model.color }}
-                          />
-                          <span className="model-copy">
-                            <strong>{model.name}</strong>
-                            <small>{kindLabel(model.kind)}</small>
-                          </span>
-                          <span className="model-count">{model.count}</span>
-                        </button>
-                        <button
-                          className="visibility"
-                          onClick={() => toggleModel(model.id)}
-                          aria-label={`${model.visible ? "Hide" : "Show"} ${model.name}`}
-                        >
-                          {model.visible ? (
-                            <Eye size={16} />
-                          ) : (
-                            <EyeOff size={16} />
-                          )}
-                        </button>
-                      </div>
-                    ))}
+                          <button
+                            className="model-select"
+                            onClick={() => setActiveModel(model.id)}
+                          >
+                            <span
+                              className="model-dot"
+                              style={{ background: model.color }}
+                            />
+                            <span className="model-copy">
+                              <strong>{model.name}</strong>
+                              <small>
+                                {model.status === "SUCCESS"
+                                  ? semanticSummary
+                                  : `Manual only · ${semanticSummary}`}
+                              </small>
+                            </span>
+                            <span className="model-count">
+                              {model.kind === "segment"
+                                ? activeSegments.length
+                                : model.kind === "people"
+                                  ? model.people_count ?? layerAnnotations.length
+                                  : layerAnnotations.length}
+                            </span>
+                          </button>
+                          <button
+                            className="visibility"
+                            onClick={() => toggleModel(model.id)}
+                            aria-label={`${model.visible ? "Hide" : "Show"} ${model.name}`}
+                          >
+                            {model.visible ? (
+                              <Eye size={16} />
+                            ) : (
+                              <EyeOff size={16} />
+                            )}
+                          </button>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
                 <div className="editor-section">
                   {!activeLayer ? (
                     <EmptyModelState
-                      title="No successful model data"
-                      description="This job has no reviewable model output."
+                      title="No model layers available"
+                      description="This job does not identify any model that can receive a manual annotation."
                     />
                   ) : activeLayer.kind === "segment" ? (
                     <AggressionEditor
@@ -1725,6 +1832,24 @@ export function ReviewDashboard({
                       onSelect={setSelectedId}
                       onUpdate={updateSelected}
                       onDelete={removeSelected}
+                      onAdd={addAnnotation}
+                      onRemoveAll={() => removeModelAnnotations(activeLayer.id)}
+                    />
+                  ) : activeLayer.kind === "group" ? (
+                    <GroupEditor
+                      model={activeLayer}
+                      selected={
+                        selected?.model_id === activeLayer.id
+                          ? selected
+                          : undefined
+                      }
+                      annotations={annotations.filter(
+                        (item) => item.model_id === activeLayer.id,
+                      )}
+                      onSelect={setSelectedId}
+                      onUpdate={updateSelected}
+                      onDelete={removeSelected}
+                      onAdd={addAnnotation}
                       onRemoveAll={() => removeModelAnnotations(activeLayer.id)}
                     />
                   ) : (
@@ -1743,6 +1868,20 @@ export function ReviewDashboard({
                       onDelete={removeSelected}
                       onAdd={addAnnotation}
                       onRemoveAll={() => removeModelAnnotations(activeLayer.id)}
+                      onPeopleCountChange={
+                        activeLayer.kind === "people"
+                          ? (peopleCount) => {
+                              setModels((items) =>
+                                items.map((item) =>
+                                  item.id === activeLayer.id
+                                    ? { ...item, people_count: peopleCount }
+                                    : item,
+                                ),
+                              );
+                              markDirty(activeLayer.id);
+                            }
+                          : undefined
+                      }
                     />
                   )}
                 </div>
@@ -1839,6 +1978,7 @@ function BoxEditor({
   onDelete,
   onAdd,
   onRemoveAll,
+  onPeopleCountChange,
 }: {
   model: VisibleModel;
   selected?: Annotation;
@@ -1848,7 +1988,10 @@ function BoxEditor({
   onDelete: () => void;
   onAdd: () => void;
   onRemoveAll: () => void;
+  onPeopleCountChange?: (count: number) => void;
 }) {
+  const isPeopleCount = model.kind === "people";
+  const peopleCount = model.people_count ?? annotations.length;
   return (
     <>
       <div className="section-heading compact">
@@ -1858,9 +2001,34 @@ function BoxEditor({
         </div>
         <span className="mode-tag">
           <Box size={13} />
-          Boxes
+          {isPeopleCount
+            ? `${peopleCount} ${peopleCount === 1 ? "person" : "people"}`
+            : "Boxes"}
         </span>
       </div>
+      {isPeopleCount && (
+        <div className="property-card people-count-card">
+          <label>
+            Total people in this frame
+            <input
+              type="number"
+              min="0"
+              step="1"
+              inputMode="numeric"
+              value={peopleCount}
+              onChange={(event) =>
+                onPeopleCountChange?.(
+                  Math.max(0, Math.floor(Number(event.target.value) || 0)),
+                )
+              }
+            />
+          </label>
+          <p className="group-editor-note">
+            Enter the total directly. Person boxes are optional and can be added
+            only when their locations are useful for retraining.
+          </p>
+        </div>
+      )}
       {annotations.length ? (
         <div className="detection-list">
           {annotations.map((item, index) => (
@@ -1884,28 +2052,34 @@ function BoxEditor({
         </div>
       ) : (
         <EmptyModelState
-          title="No detections"
-          description="This model has no boxes on the selected frame."
+          title={isPeopleCount ? "No person boxes added" : "No detections"}
+          description={
+            isPeopleCount
+              ? "No person boxes added. You can still enter the total people count above."
+              : "This model has no boxes on the selected frame."
+          }
         />
       )}
       {selected && (
         <div className="property-card">
-          <label>
-            Class
-            <select
-              value={selected.label}
-              onChange={(event) =>
-                onUpdate({
-                  label: event.target.value,
-                  class_id: model.classes.indexOf(event.target.value),
-                })
-              }
-            >
-              {model.classes.map((label) => (
-                <option key={label}>{label}</option>
-              ))}
-            </select>
-          </label>
+          {!isPeopleCount && (
+            <label>
+              Class
+              <select
+                value={selected.label}
+                onChange={(event) =>
+                  onUpdate({
+                    label: event.target.value,
+                    class_id: model.classes.indexOf(event.target.value),
+                  })
+                }
+              >
+                {model.classes.map((label) => (
+                  <option key={label}>{label}</option>
+                ))}
+              </select>
+            </label>
+          )}
           <div className="coordinate-grid">
             <label>
               X
@@ -1988,12 +2162,130 @@ function BoxEditor({
       )}
       <button className="add-button" onClick={onAdd}>
         <Plus size={16} />
-        Add annotation
+        {isPeopleCount ? "Add person" : "Add annotation"}
       </button>
       {annotations.length > 0 && (
         <button className="danger-button remove-all" onClick={onRemoveAll}>
           <Trash2 size={15} />
-          Remove all {model.short} boxes
+          {isPeopleCount ? "Remove all people" : `Remove all ${model.short} boxes`}
+        </button>
+      )}
+    </>
+  );
+}
+
+function GroupEditor({
+  model,
+  selected,
+  annotations,
+  onSelect,
+  onUpdate,
+  onDelete,
+  onAdd,
+  onRemoveAll,
+}: {
+  model: VisibleModel;
+  selected?: Annotation;
+  annotations: Annotation[];
+  onSelect: (id: string) => void;
+  onUpdate: (patch: Partial<Annotation>) => void;
+  onDelete: () => void;
+  onAdd: () => void;
+  onRemoveAll: () => void;
+}) {
+  const totalPeople = groupPeopleTotal(annotations);
+  const selectedPeople = selected ? peopleInGroup(selected) : null;
+  return (
+    <>
+      <div className="section-heading compact">
+        <div>
+          <p className="eyebrow">Group review</p>
+          <h3>{model.name}</h3>
+        </div>
+        <span className="mode-tag">
+          <Box size={13} />
+          {annotations.length} {annotations.length === 1 ? "group" : "groups"}
+        </span>
+      </div>
+      <div className="group-count-summary">
+        <span>
+          <strong>{annotations.length}</strong>
+          {annotations.length === 1 ? "Group" : "Groups"}
+        </span>
+        <span>
+          <strong>{totalPeople ?? "—"}</strong>
+          People in groups
+        </span>
+      </div>
+      {annotations.length ? (
+        <div className="detection-list">
+          {annotations.map((item, index) => {
+            const people = peopleInGroup(item);
+            return (
+              <button
+                key={item.id}
+                className={`detection-item ${selected?.id === item.id ? "active" : ""}`}
+                onClick={() => onSelect(item.id)}
+              >
+                <span style={{ borderColor: model.color }}>{index + 1}</span>
+                <div>
+                  <strong>Group {index + 1}</strong>
+                  <small>
+                    {people === null
+                      ? "People count not set"
+                      : `${people} ${people === 1 ? "person" : "people"}`}
+                  </small>
+                </div>
+                <ChevronRight size={15} />
+              </button>
+            );
+          })}
+        </div>
+      ) : (
+        <EmptyModelState
+          title="No groups detected"
+          description="Add an outer box for each group, then enter how many people belong to it."
+        />
+      )}
+      {selected && (
+        <div className="property-card">
+          <label>
+            People in this group
+            <input
+              type="number"
+              min="0"
+              step="1"
+              placeholder="Enter count"
+              value={selectedPeople ?? ""}
+              onChange={(event) => {
+                const value = event.target.value;
+                onUpdate({
+                  attributes: {
+                    ...(selected.attributes ?? {}),
+                    people_count: value === "" ? null : Math.max(0, Math.floor(Number(value))),
+                  },
+                });
+              }}
+            />
+          </label>
+          <p className="group-editor-note">
+            The box represents the complete group. This count is stored with the
+            group metadata and is separate from the number of group boxes.
+          </p>
+          <button className="danger-button" onClick={onDelete}>
+            <Trash2 size={15} />
+            Delete this group
+          </button>
+        </div>
+      )}
+      <button className="add-button" onClick={onAdd}>
+        <Plus size={16} />
+        Add group
+      </button>
+      {annotations.length > 0 && (
+        <button className="danger-button remove-all" onClick={onRemoveAll}>
+          <Trash2 size={15} />
+          Remove all groups
         </button>
       )}
     </>
@@ -2012,6 +2304,7 @@ function VehicleEditor({
   onSelect,
   onUpdate,
   onDelete,
+  onAdd,
   onRemoveAll,
 }: {
   model: VisibleModel;
@@ -2019,6 +2312,7 @@ function VehicleEditor({
   onSelect: (id: string) => void;
   onUpdate: (patch: Partial<Annotation>) => void;
   onDelete: () => void;
+  onAdd: () => void;
   onRemoveAll: () => void;
 }) {
   if (!selected)
@@ -2036,8 +2330,16 @@ function VehicleEditor({
         </div>
         <EmptyModelState
           title="No vehicle on this frame"
-          description="MMC returned no vehicle track for this sampled frame."
+          description={
+            model.status === "SUCCESS"
+              ? "MMC returned no vehicle track for this sampled frame."
+              : "MMC inference was unavailable. Add a vehicle box manually."
+          }
         />
+        <button className="add-button" onClick={onAdd}>
+          <Plus size={16} />
+          Add vehicle annotation
+        </button>
       </>
     );
   const attrs = selected.attributes ?? {};
