@@ -33,6 +33,11 @@ const CLASS_NAMES = {
   "sleep-detection": ["sleeping"],
   "fire-smoke-detection": ["fire", "smoke"],
   "fall-detection": ["falling", "standing", "sitting", "lying"],
+  "running-detection": ["running"],
+  "climb-detection": ["climbing"],
+  "restricted-zone": ["person"],
+  "people-count": ["person"],
+  "group-detection": ["group"],
   "ppe-compliance": ["person", "helmet", "vest", "no_helmet", "no_vest"],
   "mmc-vehicle-classification": [
     "vehicle",
@@ -76,9 +81,11 @@ const cache = {
   activeVideoPromise: null,
   activeBatch: null,
   frames: new Map(),
+  previews: new Map(),
 };
 const MAX_FRAME_BATCH_SIZE = 100;
 const FRAME_CACHE_LIMIT = 125;
+const VIDEO_SUFFIXES = [".mp4", ".webm", ".avi", ".mov", ".mkv", ".m4v"];
 
 const defaultClients = {
   s3: new S3Client({ region: REGION }),
@@ -177,6 +184,8 @@ export function decodePageCursor(cursor) {
 
 export function resultKind(modelId) {
   if (modelId === "mmc-vehicle-classification") return "vehicle";
+  if (modelId === "people-count") return "people";
+  if (modelId === "group-detection") return "group";
   if (modelId.includes("aggression")) return "segment";
   return "box";
 }
@@ -297,6 +306,13 @@ async function hydrateJobSummary(s3, job) {
   const response = await readJson(s3, `jobs/${job.id}/response.json`);
   const results = response.results ?? [];
   const successful = results.filter((result) => result.status === "SUCCESS");
+  let sourceAvailable = true;
+  try {
+    await resolveSourceKey(s3, job.id, response);
+  } catch (error) {
+    if (!(error instanceof HttpError) || error.statusCode !== 404) throw error;
+    sourceAvailable = false;
+  }
   const summary = {
     models: results.length,
     successful_models: successful.length,
@@ -305,8 +321,9 @@ async function hydrateJobSummary(s3, job) {
       (total, result) => total + (result.detections?.length ?? 0),
       0,
     ),
-    workflows: workflows(successful),
-    preview_available: Boolean(findPreviewKey(results)),
+    workflows: successful.length ? workflows(successful) : sourceAvailable ? ["Manual"] : [],
+    preview_available: sourceAvailable || Boolean(findPreviewKey(results)),
+    source_available: sourceAvailable,
     preferred_batch_size:
       Number(response.preferred_batch_size) === 100 ? 100 : undefined,
     failure_summary: failureSummary(results),
@@ -315,9 +332,41 @@ async function hydrateJobSummary(s3, job) {
   return { ...job, ...summary };
 }
 
-async function resolveSourceKey(s3, jobId) {
-  const candidates = await listKeys(s3, `storage/UNASSIGNED/uploads/${jobId}`);
-  if (candidates.length) return candidates[0].Key;
+async function objectExists(s3, key) {
+  try {
+    await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
+    return true;
+  } catch (error) {
+    if (isMissing(error)) return false;
+    throw error;
+  }
+}
+
+export async function resolveSourceKey(s3, jobId, response = null) {
+  const directCandidates = [
+    response?.source_key,
+    response?.footage_s3_key,
+    response?.input?.footage_s3_key,
+    response?.request?.footage_s3_key,
+    ...VIDEO_SUFFIXES.flatMap((suffix) => [
+      `storage/uploads/UNASSIGNED_${jobId}${suffix}`,
+      `storage/UNASSIGNED/uploads/${jobId}${suffix}`,
+    ]),
+  ].filter((key, index, keys) =>
+    typeof key === "string" && key.length > 0 && keys.indexOf(key) === index,
+  );
+  for (const key of directCandidates) {
+    if (await objectExists(s3, key)) return key;
+  }
+
+  const legacyCandidates = await listKeys(s3, `storage/UNASSIGNED/uploads/${jobId}`);
+  const exactLegacy = legacyCandidates.find((row) => {
+    const key = String(row.Key ?? "");
+    const fileName = key.split("/").at(-1) ?? "";
+    const suffix = extname(fileName).toLowerCase();
+    return VIDEO_SUFFIXES.includes(suffix) && fileName.slice(0, -suffix.length) === jobId;
+  });
+  if (exactLegacy?.Key) return exactLegacy.Key;
   for (const row of await listKeys(s3, `jobs/${jobId}/`)) {
     if (!String(row.Key ?? "").endsWith("/input.json")) continue;
     try {
@@ -335,7 +384,7 @@ async function loadJob(s3, jobId) {
   if (fresh(cached)) return cached.value;
   const response = await readJson(s3, `jobs/${jobId}/response.json`);
   response.job_id = jobId;
-  response.source_key = await resolveSourceKey(s3, jobId);
+  response.source_key = await resolveSourceKey(s3, jobId, response);
   const source = await s3.send(
     new HeadObjectCommand({ Bucket: BUCKET, Key: response.source_key }),
   );
@@ -722,7 +771,10 @@ function instanceAnnotations(result, frame, width, height) {
   for (const [detectionIndex, detection] of (result.detections ?? []).entries()) {
     for (const [index, instance] of (detection.instances ?? []).entries()) {
       const attributes = instance.attributes ?? {};
-      const instanceFrame = attributes.frame_number ?? instance.frame_number;
+      const instanceFrame =
+        attributes.frame_number ??
+        instance.frame_number ??
+        detection.best_frame_number;
       if (Number(instanceFrame) !== frame || !instance.bbox) continue;
       const box = instance.bbox;
       rows.push({
@@ -764,37 +816,39 @@ function segmentsForFrame(result, frame, fps) {
   });
 }
 
-async function frameReview(s3, frame, response, metadata, labelIndex) {
+export async function frameReview(s3, frame, response, metadata, labelIndex) {
   const models = [];
   for (const result of response.results ?? []) {
-    if (result.status !== "SUCCESS") continue;
     const modelId = String(result.model_id);
     const kind = resultKind(modelId);
     let annotations = [];
     let segments = [];
+    let storedMetadata = null;
     if (kind === "segment") {
       const manualEntry = labelIndex.get(`${modelId}\0${frame}`);
       if (manualEntry) {
-        const stored = await manualMetadata(s3, response.job_id, modelId, frame);
-        if (Array.isArray(stored?.segments)) segments = stored.segments;
-        else if (stored?.segment) segments = [stored.segment];
-      } else {
+        storedMetadata = await manualMetadata(s3, response.job_id, modelId, frame);
+        if (Array.isArray(storedMetadata?.segments)) segments = storedMetadata.segments;
+        else if (storedMetadata?.segment) segments = [storedMetadata.segment];
+      } else if (result.status === "SUCCESS") {
         segments = segmentsForFrame(result, frame, metadata.fps);
       }
     } else {
       const storedLabel = await labelBytes(s3, labelIndex, modelId, frame);
-      const rich = instanceAnnotations(
-        result,
-        frame,
-        metadata.width,
-        metadata.height,
-      );
-      const stored = storedLabel.manual
+      const rich = result.status === "SUCCESS"
+        ? instanceAnnotations(result, frame, metadata.width, metadata.height)
+        : [];
+      storedMetadata = storedLabel.manual
         ? await manualMetadata(s3, response.job_id, modelId, frame)
         : null;
-      annotations = storedLabel.data
-        ? parseYolo(storedLabel.data, modelId, frame, storedLabel.manual, stored)
-        : rich;
+      // Group training labels currently contain the nested person boxes, not
+      // the outer group boxes. Only a manual group override may supersede the
+      // rich group result; non-manual YOLO rows must not be rendered as groups.
+      annotations = kind === "group" && !storedLabel.manual
+        ? rich
+        : storedLabel.data
+          ? parseYolo(storedLabel.data, modelId, frame, storedLabel.manual, storedMetadata)
+          : rich;
       if (rich.length && !storedLabel.manual) annotations = rich;
     }
     const classes = [
@@ -802,6 +856,9 @@ async function frameReview(s3, frame, response, metadata, labelIndex) {
       ...(result.detections ?? []).map((detection) => String(detection.label)).filter(Boolean),
       ...annotations.map((annotation) => String(annotation.label)).filter(Boolean),
     ].filter((value, index, values) => values.indexOf(value) === index);
+    const groupPeopleCounts = annotations
+      .map((annotation) => Number(annotation.attributes?.people_count))
+      .filter(Number.isFinite);
     models.push({
       id: modelId,
       name: MODEL_NAMES[modelId] ?? modelId.replaceAll("-", " ").replace(/\b\w/g, (value) => value.toUpperCase()),
@@ -813,6 +870,17 @@ async function frameReview(s3, frame, response, metadata, labelIndex) {
       segments,
       segment: segments[0] ?? null,
       count: kind === "segment" ? segments.length : annotations.length,
+      people_count:
+        kind === "people"
+          ? Number.isInteger(storedMetadata?.people_count)
+            ? storedMetadata.people_count
+            : annotations.length
+          : undefined,
+      group_count: kind === "group" ? annotations.length : undefined,
+      grouped_people_count:
+        kind === "group" && groupPeopleCounts.length === annotations.length
+          ? groupPeopleCounts.reduce((total, count) => total + count, 0)
+          : undefined,
       classes: classes.length ? classes : ["detection"],
     });
   }
@@ -875,7 +943,15 @@ function normalizeCorrection(correction) {
       confidence: numberInRange(segment.confidence ?? 1, 0, 1, "confidence"),
     };
   });
-  return { modelId, annotations, segments };
+  const peopleCount = correction?.people_count === undefined
+    ? undefined
+    : Math.floor(numberInRange(
+        correction.people_count,
+        0,
+        Number.MAX_SAFE_INTEGER,
+        "people_count",
+      ));
+  return { modelId, annotations, segments, peopleCount };
 }
 
 export async function writeFrameCorrections(s3, jobId, frameNumber, corrections) {
@@ -910,6 +986,7 @@ export async function writeFrameCorrections(s3, jobId, frameNumber, corrections)
       kind: resultKind(correction.modelId),
       frame_number: frameNumber,
       annotations: correction.annotations,
+      people_count: correction.peopleCount,
       segments: correction.segments,
       segment: correction.segments[0] ?? null,
       updated_at: new Date().toISOString(),
@@ -1158,17 +1235,73 @@ export async function getJobDetail(jobIdValue, query = {}, { s3 = defaultClients
     };
 }
 
-export async function getPreviewUrl(jobIdValue, { s3 = defaultClients.s3 } = {}) {
+async function sourcePreview(s3, job) {
+    const cacheKey = `${job.job_id}\0${job.source_etag}`;
+    const cached = cache.previews.get(cacheKey);
+    if (cached?.data) return cached.data;
+    if (cached?.promise) return cached.promise;
+
+    const promise = (async () => {
+      await ensureCacheRoot();
+      const folder = await mkdtemp(join(CACHE_ROOT, "preview-"));
+      const sourcePath = join(folder, `source${extname(job.source_key) || ".mp4"}`);
+      const previewPath = join(folder, "preview.jpg");
+      try {
+        const response = await s3.send(
+          new GetObjectCommand({ Bucket: BUCKET, Key: job.source_key }),
+        );
+        if (!response.Body) throw new HttpError(404, "The source video has no body");
+        await pipeline(response.Body, createWriteStream(sourcePath));
+        await runProcess(FFMPEG, [
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-y",
+          "-i",
+          sourcePath,
+          "-frames:v",
+          "1",
+          "-vf",
+          "scale=320:-2",
+          "-q:v",
+          "5",
+          previewPath,
+        ]);
+        return await readFile(previewPath);
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        throw new HttpError(422, `Could not create a source-video preview: ${error.message}`);
+      } finally {
+        await rm(folder, { recursive: true, force: true });
+      }
+    })();
+    cache.previews.set(cacheKey, { promise });
+    try {
+      const data = await promise;
+      cache.previews.set(cacheKey, { data });
+      while (cache.previews.size > 100) {
+        cache.previews.delete(cache.previews.keys().next().value);
+      }
+      return data;
+    } catch (error) {
+      cache.previews.delete(cacheKey);
+      throw error;
+    }
+}
+
+export async function getPreviewImage(jobIdValue, { s3 = defaultClients.s3 } = {}) {
     const jobId = validateId(jobIdValue, "job ID");
     const response = await loadJob(s3, jobId);
     const key = findPreviewKey(response.results ?? []);
-    if (!key) throw new HttpError(404, "No preview image exists for this job");
-    const url = await getSignedUrl(
-      s3,
-      new GetObjectCommand({ Bucket: BUCKET, Key: key }),
-      { expiresIn: 300 },
-    );
-    return url;
+    if (key) {
+      const redirectUrl = await getSignedUrl(
+        s3,
+        new GetObjectCommand({ Bucket: BUCKET, Key: key }),
+        { expiresIn: 300 },
+      );
+      return { redirectUrl, data: null };
+    }
+    return { redirectUrl: null, data: await sourcePreview(s3, response) };
 }
 
 export async function getFrameImage(jobIdValue, frameNumberValue, { s3 = defaultClients.s3 } = {}) {
@@ -1295,4 +1428,5 @@ export function resetCachesForTests() {
   cache.activeVideoPromise = null;
   cache.activeBatch = null;
   cache.frames.clear();
+  cache.previews.clear();
 }
