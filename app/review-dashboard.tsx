@@ -50,6 +50,7 @@ import {
   JobSummary,
   Segment,
 } from "./api";
+import { adjacentFrame, frameWindow, mergeFrameNumbers } from "./frame-filter.mjs";
 
 type VisibleModel = FrameModel & { visible: boolean };
 type DragMode = "move" | "nw" | "ne" | "sw" | "se";
@@ -61,6 +62,7 @@ type FrameDraft = {
 };
 type PendingNavigation = { run: () => void } | null;
 type JobFilter = "all" | "reviewable" | "unavailable";
+type FrameFilter = "all" | "corrected";
 
 const FULL_JOB_PRELOAD_LIMIT = 100;
 const FRAME_PRELOAD_CONCURRENCY = 4;
@@ -157,6 +159,8 @@ export function ReviewDashboard({
   );
   const [fitMode, setFitMode] = useState<"cover" | "contain">("contain");
   const [jumpFrame, setJumpFrame] = useState("");
+  const [frameFilter, setFrameFilter] = useState<FrameFilter>("all");
+  const [reviewedFrameNumbers, setReviewedFrameNumbers] = useState<number[]>([]);
   const stageRef = useRef<HTMLDivElement>(null);
   const draftsRef = useRef<Record<string, FrameDraft>>({});
   const historyMarkerRef = useRef("");
@@ -214,6 +218,25 @@ export function ReviewDashboard({
     if (currentDirty && currentFrame) numbers.add(currentFrame.frame_number);
     return numbers;
   }, [currentDirty, currentFrame, drafts]);
+  const reviewedFrameSet = useMemo(
+    () => new Set(reviewedFrameNumbers),
+    [reviewedFrameNumbers],
+  );
+  const visibleCorrectedFrames = useMemo(
+    () =>
+      frameWindow(
+        reviewedFrameNumbers,
+        currentFrame?.frame_number ?? -1,
+        visibleThumbnailCount,
+      ),
+    [reviewedFrameNumbers, currentFrame?.frame_number, visibleThumbnailCount],
+  );
+  const currentCorrectedIndex = currentFrame
+    ? reviewedFrameNumbers.indexOf(currentFrame.frame_number)
+    : -1;
+  const currentFrameSaved = currentFrame
+    ? reviewedFrameSet.has(currentFrame.frame_number) || currentFrame.reviewed
+    : false;
   const dirty = pendingFrameNumbers.size > 0;
 
   function frameImageKey(source: JobDetail, frameNumber: number) {
@@ -402,6 +425,9 @@ export function ReviewDashboard({
                 Math.max(0, cached.frames.length - 1),
               );
         setDetail(cached);
+        setReviewedFrameNumbers((current) =>
+          mergeFrameNumbers(current, cached.reviewed_frames),
+        );
         applyFrame(index, cached);
         batchEdgeRef.current = "first";
         batchTargetIndexRef.current = null;
@@ -430,6 +456,9 @@ export function ReviewDashboard({
                 );
           batchCacheRef.current.set(result.batch, result);
           setDetail(result);
+          setReviewedFrameNumbers((current) =>
+            mergeFrameNumbers(current, result.reviewed_frames),
+          );
           applyFrame(index, result);
           batchEdgeRef.current = "first";
           batchTargetIndexRef.current = null;
@@ -778,6 +807,15 @@ export function ReviewDashboard({
 
   function goRelativeFrame(direction: -1 | 1) {
     if (!detail || loading) return;
+    if (frameFilter === "corrected") {
+      const target = adjacentFrame(
+        reviewedFrameNumbers,
+        currentFrame?.frame_number ?? -1,
+        direction,
+      );
+      if (target !== null) goToSampledFrame(target);
+      return;
+    }
     const next = currentFrameIndex + direction;
     if (next >= 0 && next < detail.frames.length) {
       goToFrame(next);
@@ -809,8 +847,9 @@ export function ReviewDashboard({
     setJumpFrame("");
   }
 
-  function goToSampledFrame(requested: number) {
+  function goToSampledFrame(requested: number, stageCurrent = true) {
     if (!detail) return;
+    if (stageCurrent) stageCurrentFrame();
     const interval = Math.max(1, detail.sample_interval || 15);
     const sampled = Math.round(requested / interval) * interval;
     const targetBatch = Math.floor(sampled / interval / detail.batch_size);
@@ -820,7 +859,6 @@ export function ReviewDashboard({
     else {
       batchEdgeRef.current = "first";
       batchTargetIndexRef.current = targetIndex;
-      stageCurrentFrame();
       setPreparingBatch(true);
       setImageLoading(true);
       setLoading(true);
@@ -829,18 +867,33 @@ export function ReviewDashboard({
   }
 
   function goToNextReviewedFrame() {
-    if (!detail?.reviewed_frames.length || !currentFrame) return;
+    if (!reviewedFrameNumbers.length || !currentFrame) return;
     const target =
-      detail.reviewed_frames.find(
+      reviewedFrameNumbers.find(
         (frame) => frame > currentFrame.frame_number,
-      ) ?? detail.reviewed_frames[0];
+      ) ?? reviewedFrameNumbers[0];
     goToSampledFrame(target);
+  }
+
+  function changeFrameFilter(nextFilter: FrameFilter) {
+    if (nextFilter === frameFilter) return;
+    stageCurrentFrame();
+    setFrameFilter(nextFilter);
+    if (
+      nextFilter === "corrected" &&
+      reviewedFrameNumbers.length > 0 &&
+      (!currentFrame ||
+        !reviewedFrameNumbers.includes(currentFrame.frame_number))
+    ) {
+      goToSampledFrame(reviewedFrameNumbers[0], false);
+    }
   }
 
   function resetChanges() {
     if (!detail || !currentFrame) return;
+    const resetFrameNumber = currentFrame.frame_number;
     const nextDrafts = { ...draftsRef.current };
-    delete nextDrafts[String(currentFrame.frame_number)];
+    delete nextDrafts[String(resetFrameNumber)];
     draftsRef.current = nextDrafts;
     setDrafts(nextDrafts);
     applyFrame(currentFrameIndex, detail, false, false);
@@ -978,6 +1031,11 @@ export function ReviewDashboard({
           .filter((item) => item.saved)
           .map((item) => item.frame_number),
       );
+      const nextReviewedFrames = mergeFrameNumbers(
+        reviewedFrameNumbers,
+        successfulFrames,
+      );
+      setReviewedFrameNumbers(nextReviewedFrames);
       const failedDrafts = Object.fromEntries(
         Object.entries(pendingDrafts).filter(
           ([frameNumber]) => !successfulFrames.has(Number(frameNumber)),
@@ -987,8 +1045,8 @@ export function ReviewDashboard({
         ? {
             ...detail,
             reviewed_frames: [
-              ...new Set([...detail.reviewed_frames, ...successfulFrames]),
-            ].sort((a, b) => a - b),
+              ...nextReviewedFrames,
+            ],
             frames: detail.frames.map((frame) => {
               const draft = pendingDrafts[String(frame.frame_number)];
               if (!draft || !successfulFrames.has(frame.frame_number))
@@ -1032,6 +1090,8 @@ export function ReviewDashboard({
       draftsRef.current = failedDrafts;
       setDrafts(failedDrafts);
       if (nextDetail) {
+        batchCacheRef.current.clear();
+        batchCacheRef.current.set(nextDetail.batch, nextDetail);
         setDetail(nextDetail);
         const currentFailed = failedDrafts[String(currentFrame.frame_number)];
         if (currentFailed)
@@ -1353,7 +1413,7 @@ export function ReviewDashboard({
               <div className="frame-title">
                 <span>
                   Frame {currentFrame?.frame_number ?? "—"}
-                  {currentFrame?.reviewed && (
+                  {currentFrameSaved && (
                     <i className="reviewed-frame-pill">
                       <Check size={11} />
                       Reviewer corrected
@@ -1531,60 +1591,164 @@ export function ReviewDashboard({
                 </span>
               </div>
             </div>
+            <div className="frame-filter-bar">
+              <div className="frame-filter-copy">
+                <strong>Frame view</strong>
+                <small>Limit the filmstrip to frames saved by a reviewer.</small>
+              </div>
+              <div
+                className="frame-filter-tabs"
+                role="group"
+                aria-label="Choose frames to display"
+              >
+                <button
+                  type="button"
+                  className={frameFilter === "all" ? "active" : ""}
+                  onClick={() => changeFrameFilter("all")}
+                  aria-pressed={frameFilter === "all"}
+                >
+                  <Layers3 size={14} />
+                  <span>All frames</span>
+                  <em>{detail?.total_frames ?? 0}</em>
+                </button>
+                <button
+                  type="button"
+                  className={frameFilter === "corrected" ? "active" : ""}
+                  onClick={() => changeFrameFilter("corrected")}
+                  aria-pressed={frameFilter === "corrected"}
+                  title="Show only frames with saved reviewer corrections"
+                >
+                  <Check size={14} />
+                  <span>Corrected only</span>
+                  <em>{reviewedFrameNumbers.length}</em>
+                </button>
+              </div>
+            </div>
             <div className="frame-strip">
               <button
                 className="strip-nav"
                 onClick={() => goRelativeFrame(-1)}
-                disabled={currentFrameIndex === 0 && batch === 0}
+                disabled={
+                  frameFilter === "corrected"
+                    ? currentCorrectedIndex <= 0
+                    : currentFrameIndex === 0 && batch === 0
+                }
                 aria-label="Previous frame"
               >
                 <ArrowLeft size={17} />
               </button>
               <div className="frame-thumbnails">
-                {visibleFrames.map((frame, offset) => {
-                  const index = thumbnailWindowStart + offset;
-                  const unsaved = pendingFrameNumbers.has(frame.frame_number);
-                  return (
-                    <button
-                      key={frame.frame_number}
-                      className={`frame-thumb ${index === currentFrameIndex ? "frame-thumb-active" : ""} ${unsaved ? "frame-thumb-draft" : ""} ${frame.reviewed ? "frame-thumb-reviewed" : ""}`}
-                      onClick={() => goToFrame(index)}
-                      title={
-                        frame.reviewed
-                          ? `Reviewer corrected: ${frame.corrected_models.join(", ")}`
-                          : `Frame ${frame.frame_number}`
-                      }
-                    >
-                      <span className="mini-scene mini-scene-ready">
-                        <Cloud size={12} />
-                      </span>
-                      <strong>{frame.frame_number}</strong>
-                      <small>{(frame.timestamp_ms / 1000).toFixed(1)}s</small>
-                      {unsaved ? (
-                        <span
-                          className="draft-dot"
-                          title="Unsaved correction"
-                        />
-                      ) : frame.reviewed ? (
-                        <span
-                          className="reviewed-dot"
-                          title="Saved reviewer correction"
-                        >
-                          <Check size={9} />
+                {frameFilter === "all" ? (
+                  visibleFrames.map((frame, offset) => {
+                    const index = thumbnailWindowStart + offset;
+                    const unsaved = pendingFrameNumbers.has(frame.frame_number);
+                    const saved =
+                      reviewedFrameSet.has(frame.frame_number) || frame.reviewed;
+                    return (
+                      <button
+                        key={frame.frame_number}
+                        className={`frame-thumb ${index === currentFrameIndex ? "frame-thumb-active" : ""} ${unsaved ? "frame-thumb-draft" : ""} ${saved ? "frame-thumb-reviewed" : ""}`}
+                        onClick={() => goToFrame(index)}
+                        title={
+                          unsaved
+                            ? saved
+                              ? "Unsaved edits on a previously saved frame"
+                              : "Unsaved correction"
+                            : saved
+                              ? `Reviewer corrected: ${frame.corrected_models.join(", ") || "saved changes"}`
+                              : `Frame ${frame.frame_number}`
+                        }
+                      >
+                        <span className="mini-scene mini-scene-ready">
+                          {detail ? (
+                            <Image
+                              src={frameImageUrl(detail, frame.frame_number)}
+                              alt={`Frame ${frame.frame_number} preview`}
+                              fill
+                              sizes="120px"
+                              unoptimized
+                            />
+                          ) : (
+                            <Cloud size={12} />
+                          )}
                         </span>
-                      ) : (
-                        frame.models.some((model) => model.count) && <i />
-                      )}
-                    </button>
-                  );
-                })}
+                        <strong>{frame.frame_number}</strong>
+                        <small>{(frame.timestamp_ms / 1000).toFixed(1)}s</small>
+                        {unsaved ? (
+                          <span className="draft-dot" title="Unsaved correction" />
+                        ) : saved ? (
+                          <span className="reviewed-dot" title="Saved reviewer correction">
+                            <Check size={9} />
+                          </span>
+                        ) : (
+                          frame.models.some((model) => model.count) && <i />
+                        )}
+                      </button>
+                    );
+                  })
+                ) : visibleCorrectedFrames.length ? (
+                  visibleCorrectedFrames.map((frameNumber) => {
+                    const unsaved = pendingFrameNumbers.has(frameNumber);
+                    const saved = reviewedFrameSet.has(frameNumber);
+                    return (
+                      <button
+                        key={frameNumber}
+                        className={`frame-thumb ${currentFrame?.frame_number === frameNumber ? "frame-thumb-active" : ""} ${unsaved ? "frame-thumb-draft" : ""} ${saved ? "frame-thumb-reviewed" : ""}`}
+                        onClick={() => goToSampledFrame(frameNumber)}
+                        title={
+                          unsaved
+                            ? saved
+                              ? "Unsaved edits on a previously saved frame"
+                              : "Unsaved correction"
+                            : "Saved reviewer correction"
+                        }
+                      >
+                        <span className="mini-scene mini-scene-ready">
+                          {detail ? (
+                            <Image
+                              src={frameImageUrl(detail, frameNumber)}
+                              alt={`Corrected frame ${frameNumber} preview`}
+                              fill
+                              sizes="120px"
+                              unoptimized
+                            />
+                          ) : (
+                            <Cloud size={12} />
+                          )}
+                        </span>
+                        <strong>{frameNumber}</strong>
+                        <small>
+                          {(frameNumber / Math.max(detail?.metadata.fps ?? 1, 1)).toFixed(1)}s
+                        </small>
+                        {unsaved ? (
+                          <span className="draft-dot" title="Unsaved correction" />
+                        ) : (
+                          <span className="reviewed-dot" title="Saved reviewer correction">
+                            <Check size={9} />
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })
+                ) : (
+                  <div className="corrected-frames-empty">
+                    <Check size={15} />
+                    <span>
+                      <strong>No corrected frames yet</strong>
+                      Save a correction first, or return to all frames.
+                    </span>
+                  </div>
+                )}
               </div>
               <button
                 className="strip-nav"
                 onClick={() => goRelativeFrame(1)}
                 disabled={
-                  currentFrameIndex >= (detail?.frames.length ?? 1) - 1 &&
-                  batch >= (detail?.total_batches ?? 1) - 1
+                  frameFilter === "corrected"
+                    ? currentCorrectedIndex < 0 ||
+                      currentCorrectedIndex >= reviewedFrameNumbers.length - 1
+                    : currentFrameIndex >= (detail?.frames.length ?? 1) - 1 &&
+                      batch >= (detail?.total_batches ?? 1) - 1
                 }
                 aria-label="Next frame"
               >
@@ -1593,17 +1757,24 @@ export function ReviewDashboard({
             </div>
             <div className="batch-footer">
               <span>
-                Batch {(detail?.batch ?? 0) + 1} of {detail?.total_batches ?? 1}
+                {frameFilter === "corrected"
+                  ? "Corrected frames"
+                  : `Batch ${(detail?.batch ?? 0) + 1} of ${detail?.total_batches ?? 1}`}
               </span>
               <div className="batch-progress">
                 <i
                   style={{
-                    width: `${((currentFrameIndex + 1) / Math.max(detail?.frames.length ?? 1, 1)) * 100}%`,
+                    width:
+                      frameFilter === "corrected"
+                        ? `${((currentCorrectedIndex + 1) / Math.max(reviewedFrameNumbers.length, 1)) * 100}%`
+                        : `${((currentFrameIndex + 1) / Math.max(detail?.frames.length ?? 1, 1)) * 100}%`,
                   }}
                 />
               </div>
               <span>
-                {currentFrameIndex + 1} / {detail?.frames.length ?? 0}
+                {frameFilter === "corrected"
+                  ? `${Math.max(0, currentCorrectedIndex + 1)} / ${reviewedFrameNumbers.length}`
+                  : `${currentFrameIndex + 1} / ${detail?.frames.length ?? 0}`}
               </span>
               <div className="batch-legend">
                 <span>
@@ -1617,26 +1788,32 @@ export function ReviewDashboard({
                   Unsaved
                 </span>
               </div>
-              <form
-                className="frame-jump"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  jumpToRequestedFrame();
-                }}
-              >
-                <input
-                  value={jumpFrame}
-                  onChange={(event) => setJumpFrame(event.target.value)}
-                  inputMode="numeric"
-                  placeholder="Frame #"
-                  aria-label="Jump to sampled frame"
-                />
-                <button type="submit" disabled={!jumpFrame}>
-                  Go
-                </button>
-              </form>
+              {frameFilter === "all" && (
+                <form
+                  className="frame-jump"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    jumpToRequestedFrame();
+                  }}
+                >
+                  <input
+                    value={jumpFrame}
+                    onChange={(event) => setJumpFrame(event.target.value)}
+                    inputMode="numeric"
+                    placeholder="Frame #"
+                    aria-label="Jump to sampled frame"
+                  />
+                  <button type="submit" disabled={!jumpFrame}>
+                    Go
+                  </button>
+                </form>
+              )}
               <div className="shortcut-hint">
-                {detail && detail.total_batches > 1 && (
+                {frameFilter === "corrected" ? (
+                  <button onClick={() => changeFrameFilter("all")}>
+                    Show all frames
+                  </button>
+                ) : detail && detail.total_batches > 1 ? (
                   <>
                     <button
                       onClick={() => goToBatch(Math.max(0, batch - 1))}
@@ -1653,7 +1830,7 @@ export function ReviewDashboard({
                       Next batch
                     </button>
                   </>
-                )}
+                ) : null}
               </div>
             </div>
           </div>
@@ -1700,7 +1877,7 @@ export function ReviewDashboard({
                     <dd>
                       {currentDirty
                         ? "Unsaved changes"
-                        : currentFrame?.reviewed
+                        : currentFrameSaved
                           ? "Reviewer corrected"
                           : "Machine output"}
                     </dd>
@@ -1717,7 +1894,7 @@ export function ReviewDashboard({
                 <button
                   className="add-button"
                   onClick={goToNextReviewedFrame}
-                  disabled={!detail?.reviewed_frames.length}
+                  disabled={!reviewedFrameNumbers.length}
                 >
                   <Check size={15} />
                   Next reviewer-corrected frame
