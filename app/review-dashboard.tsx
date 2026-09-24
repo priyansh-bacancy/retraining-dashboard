@@ -51,6 +51,7 @@ import {
   Segment,
 } from "./api";
 import { adjacentFrame, frameWindow, mergeFrameNumbers } from "./frame-filter.mjs";
+import { ReviewerBadge } from "./reviewer-identity";
 
 type VisibleModel = FrameModel & { visible: boolean };
 type DragMode = "move" | "nw" | "ne" | "sw" | "se";
@@ -61,7 +62,7 @@ type FrameDraft = {
   segments: Segment[];
 };
 type PendingNavigation = { run: () => void } | null;
-type JobFilter = "all" | "reviewable" | "unavailable";
+type JobFilter = "all" | "reviewable" | "corrected" | "unavailable";
 type FrameFilter = "all" | "corrected";
 
 const FULL_JOB_PRELOAD_LIMIT = 100;
@@ -189,7 +190,9 @@ export function ReviewDashboard({
       jobFilter === "all" ||
       (jobFilter === "reviewable"
         ? item.source_available
-        : !item.source_available);
+        : jobFilter === "corrected"
+          ? item.has_corrections
+          : !item.source_available);
     return matchesQuery && matchesFilter;
   });
   const selected = annotations.find((item) => item.id === selectedId);
@@ -1178,13 +1181,7 @@ export function ReviewDashboard({
         </div>
         <div className="topbar-status">
           <ConnectionState health={health} />
-          <div className="reviewer" aria-label="Current reviewer">
-            <div className="avatar" aria-hidden="true">PD</div>
-            <div>
-              <strong>Priyansh</strong>
-              <span>Reviewer</span>
-            </div>
-          </div>
+          <ReviewerBadge identity={health?.reviewer} />
         </div>
       </header>
       <aside className={`jobs-panel ${mobileJobs ? "jobs-panel-open" : ""}`}>
@@ -1253,6 +1250,15 @@ export function ReviewDashboard({
                   }}
                 >
                   Reviewable
+                </button>
+                <button
+                  className={jobFilter === "corrected" ? "active" : ""}
+                  onClick={() => {
+                    setJobFilter("corrected");
+                    setFilterOpen(false);
+                  }}
+                >
+                  Corrected
                 </button>
                 <button
                   className={jobFilter === "unavailable" ? "active" : ""}

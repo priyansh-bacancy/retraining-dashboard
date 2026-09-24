@@ -25,6 +25,11 @@ group boxes separate from each group's `people_count` and nested
 `person_boxes`, and falls back to the stored `best_frame_number` when legacy
 instances have no frame number.
 
+The job dashboard can filter to jobs containing saved reviewer corrections,
+and the annotation workspace can filter to corrected frames. Reviewer display
+details are configured at runtime with `REVIEWER_NAME` and `REVIEWER_ROLE`, so
+no individual user identity is hardcoded in the interface.
+
 The dashboard contains no Python service and requires no separate API process. AWS credentials stay on the server and are never sent to the browser. Existing inference outputs remain unchanged.
 
 ## Run locally

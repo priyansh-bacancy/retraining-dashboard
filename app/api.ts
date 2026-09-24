@@ -5,6 +5,13 @@ export type Health = {
   bucket: string;
   region: string;
   account: string;
+  reviewer: ReviewerIdentity;
+};
+
+export type ReviewerIdentity = {
+  name: string;
+  role: string;
+  initials: string;
 };
 
 export type JobSummary = {
@@ -18,6 +25,7 @@ export type JobSummary = {
   workflows: string[];
   preview_available: boolean;
   source_available: boolean;
+  has_corrections: boolean;
   preview_tone: number;
   preferred_batch_size?: number;
   failure_summary?: string | null;

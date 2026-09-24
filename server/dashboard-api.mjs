@@ -73,6 +73,8 @@ class HttpError extends Error {
 
 const cache = {
   jobs: { at: 0, value: [] },
+  correctedJobs: { at: 0, value: new Set() },
+  reviewableJobs: { at: 0, value: new Set() },
   pages: new Map(),
   summaries: new Map(),
   jobsById: new Map(),
@@ -164,6 +166,80 @@ async function listKeys(s3, prefix) {
       : undefined;
   } while (continuationToken);
   return rows;
+}
+
+async function loadCorrectedJobIds(s3) {
+  if (fresh(cache.correctedJobs)) return cache.correctedJobs.value;
+  const jobIds = new Set();
+  let continuationToken;
+  do {
+    const response = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: BUCKET,
+        Prefix: "manual-annotations/",
+        Delimiter: "/",
+        ContinuationToken: continuationToken,
+      }),
+    );
+    for (const row of response.CommonPrefixes ?? []) {
+      const match = /^manual-annotations\/([^/]+)\/$/.exec(
+        String(row.Prefix ?? ""),
+      );
+      if (match && SAFE_ID.test(match[1])) jobIds.add(match[1]);
+    }
+    continuationToken = response.IsTruncated
+      ? response.NextContinuationToken
+      : undefined;
+  } while (continuationToken);
+  cache.correctedJobs = { at: Date.now(), value: jobIds };
+  return jobIds;
+}
+
+async function loadReviewableJobIds(s3) {
+  if (fresh(cache.reviewableJobs)) return cache.reviewableJobs.value;
+  const jobIds = new Set();
+  const layouts = [
+    {
+      prefix: "storage/uploads/UNASSIGNED_",
+      jobId(key) {
+        const fileName = key.slice(this.prefix.length).split("/")[0];
+        const suffix = extname(fileName).toLowerCase();
+        return VIDEO_SUFFIXES.includes(suffix)
+          ? fileName.slice(0, -suffix.length)
+          : "";
+      },
+    },
+    {
+      prefix: "storage/UNASSIGNED/uploads/",
+      jobId(key) {
+        const fileName = key.slice(this.prefix.length).split("/")[0];
+        const suffix = extname(fileName).toLowerCase();
+        return VIDEO_SUFFIXES.includes(suffix)
+          ? fileName.slice(0, -suffix.length)
+          : "";
+      },
+    },
+  ];
+  for (const layout of layouts) {
+    for (const row of await listKeys(s3, layout.prefix)) {
+      const jobId = layout.jobId(String(row.Key ?? ""));
+      if (SAFE_ID.test(jobId)) jobIds.add(jobId);
+    }
+  }
+  cache.reviewableJobs = { at: Date.now(), value: jobIds };
+  return jobIds;
+}
+
+export function reviewerIdentity(environment = process.env) {
+  const name = String(environment.REVIEWER_NAME ?? "Review Team").trim() ||
+    "Review Team";
+  const role = String(environment.REVIEWER_ROLE ?? "Reviewer").trim() ||
+    "Reviewer";
+  const words = name.split(/\s+/).filter(Boolean);
+  const initials = `${words[0]?.[0] ?? "R"}${words.length > 1 ? words.at(-1)[0] : ""}`
+    .toUpperCase()
+    .slice(0, 2);
+  return { name, role, initials };
 }
 
 export function encodePageCursor(offset) {
@@ -1054,17 +1130,22 @@ function dateQuery(value, label) {
   return date;
 }
 
-function cacheKeyForPage(query) {
+export function cacheKeyForPage(query) {
   return JSON.stringify([
     query.range,
     query.start ?? null,
     query.end ?? null,
     query.limit,
     query.continuation_token ?? null,
+    query.filter ?? "all",
   ]);
 }
 
-export async function getHealth({ s3 = defaultClients.s3, sts = defaultClients.sts } = {}) {
+export async function getHealth({
+  s3 = defaultClients.s3,
+  sts = defaultClients.sts,
+  environment = process.env,
+} = {}) {
   await ensureCacheRoot();
   if (fresh(cache.health)) return cache.health.value;
   try {
@@ -1077,6 +1158,7 @@ export async function getHealth({ s3 = defaultClients.s3, sts = defaultClients.s
       bucket: BUCKET,
       region: REGION,
       account: identity.Account,
+      reviewer: reviewerIdentity(environment),
     };
     cache.health = { at: Date.now(), value };
     return value;
@@ -1111,6 +1193,13 @@ export async function getJobs(query = {}, { s3 = defaultClients.s3 } = {}) {
       rangeStart = new Date(Date.now() - hours * 3_600_000);
     }
     const search = String(query.search ?? "").trim();
+    const filter = String(query.filter ?? "all");
+    if (!new Set(["all", "reviewable", "corrected"]).has(filter)) {
+      throw new HttpError(422, "Invalid job filter");
+    }
+    const correctedJobIds = await loadCorrectedJobIds(s3);
+    const reviewableJobIds =
+      filter === "reviewable" ? await loadReviewableJobIds(s3) : null;
     if (search) {
       if (SAFE_ID.test(search)) {
         try {
@@ -1131,8 +1220,26 @@ export async function getJobs(query = {}, { s3 = defaultClients.s3 } = {}) {
               time: humanAge(modified),
               preview_tone: 0,
             });
+            if (filter === "corrected" && !correctedJobIds.has(job.id)) {
+              return {
+                jobs: [],
+                count: 0,
+                total_count: 0,
+                limit,
+                next_continuation_token: null,
+              };
+            }
+            if (filter === "reviewable" && !job.source_available) {
+              return {
+                jobs: [],
+                count: 0,
+                total_count: 0,
+                limit,
+                next_continuation_token: null,
+              };
+            }
             return {
-              jobs: [job],
+              jobs: [{ ...job, has_corrections: correctedJobIds.has(job.id) }],
               count: 1,
               total_count: 1,
               limit,
@@ -1160,7 +1267,9 @@ export async function getJobs(query = {}, { s3 = defaultClients.s3 } = {}) {
         const captured = new Date(job.captured);
         return (
           (!rangeStart || captured >= rangeStart) &&
-          (!rangeEnd || captured <= rangeEnd)
+          (!rangeEnd || captured <= rangeEnd) &&
+          (filter !== "corrected" || correctedJobIds.has(job.id)) &&
+          (filter !== "reviewable" || reviewableJobIds.has(job.id))
         );
       })
       .sort((left, right) => right.captured.localeCompare(left.captured));
@@ -1173,7 +1282,12 @@ export async function getJobs(query = {}, { s3 = defaultClients.s3 } = {}) {
         throw error;
       }
     });
-    const visible = hydrated.filter(Boolean);
+    const visible = hydrated
+      .filter(Boolean)
+      .map((job) => ({
+        ...job,
+        has_corrections: correctedJobIds.has(job.id),
+      }));
     const nextOffset = offset + rows.length;
     const value = {
       jobs: visible,
@@ -1341,6 +1455,11 @@ export async function saveFrameCorrections(jobIdValue, frameNumberValue, body, {
       frameNumber,
       body?.corrections ?? [],
     );
+    if (written.length) {
+      cache.correctedJobs.value.add(jobId);
+      cache.correctedJobs.at = Date.now();
+      cache.pages.clear();
+    }
     cache.jobsById.delete(jobId);
     return { saved: true, written };
 }
@@ -1372,6 +1491,7 @@ export async function saveBatchCorrections(jobIdValue, body, { s3 = defaultClien
           frameNumber,
           frame.corrections ?? [],
         );
+        if (written.length) cache.correctedJobs.value.add(jobId);
         results.push({ frame_number: frameNumber, saved: true, written });
       } catch (error) {
         results.push({
@@ -1382,6 +1502,8 @@ export async function saveBatchCorrections(jobIdValue, body, { s3 = defaultClien
       }
     }
     cache.jobsById.delete(jobId);
+    cache.correctedJobs.at = Date.now();
+    cache.pages.clear();
     const failedCount = results.filter((result) => !result.saved).length;
     return {
       saved: failedCount === 0,
@@ -1420,6 +1542,8 @@ export async function routeResponse(operation) {
 
 export function resetCachesForTests() {
   cache.jobs = { at: 0, value: [] };
+  cache.correctedJobs = { at: 0, value: new Set() };
+  cache.reviewableJobs = { at: 0, value: new Set() };
   cache.pages.clear();
   cache.summaries.clear();
   cache.jobsById.clear();
