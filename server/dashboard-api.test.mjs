@@ -2,15 +2,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  cacheKeyForPage,
   completeFrameNumbers,
   decodePageCursor,
   encodePageCursor,
   getHealth,
+  getJobs,
   frameReview,
   resetCachesForTests,
   resolveSourceKey,
   resultKind,
+  reviewerIdentity,
+  routeResponse,
   selectBatch,
+  selectRequestedBatch,
   writeFrameCorrections,
 } from "./dashboard-api.mjs";
 
@@ -32,6 +37,39 @@ test("cursor and frame batching remain compatible with the dashboard", () => {
     selected: [75, 90, 105],
     totalBatches: 2,
   });
+});
+
+test("an exact corrected frame resolves to its real sorted batch", () => {
+  const numbers = [0, 15, 30, 41, 45, 60, 75];
+  assert.deepEqual(selectRequestedBatch(numbers, 0, 3, 41), {
+    batch: 1,
+    selected: [41, 45, 60],
+    totalBatches: 3,
+  });
+  assert.throws(
+    () => selectRequestedBatch(numbers, 0, 3, 42),
+    /not in this job's review set/,
+  );
+});
+
+test("filesystem cache permission errors return an actionable service message", async () => {
+  const response = await routeResponse(async () => {
+    const error = new Error("permission denied");
+    error.code = "EACCES";
+    throw error;
+  });
+  assert.equal(response.status, 503);
+  assert.match((await response.json()).detail, /frame cache is not writable/i);
+});
+
+test("job page cache keeps all, reviewable, and corrected filters separate", () => {
+  const base = { range: "7d", limit: 25 };
+  const keys = new Set([
+    cacheKeyForPage({ ...base, filter: "all" }),
+    cacheKeyForPage({ ...base, filter: "reviewable" }),
+    cacheKeyForPage({ ...base, filter: "corrected" }),
+  ]);
+  assert.equal(keys.size, 3);
 });
 
 test("model workflow kinds preserve MMC and aggression handling", () => {
@@ -340,11 +378,163 @@ test("health service uses injected Node AWS clients", async () => {
   resetCachesForTests();
   const s3 = { async send() { return {}; } };
   const sts = { async send() { return { Account: "126378326989" }; } };
-  const response = await getHealth({ s3, sts });
+  const response = await getHealth({ s3, sts, environment: {} });
   assert.deepEqual(response, {
     status: "ok",
     bucket: "icu-solarcam-storage-bacancy-ap-southeast-2",
     region: "ap-southeast-2",
     account: "126378326989",
+    reviewer: {
+      name: "Review Team",
+      role: "Reviewer",
+      initials: "RT",
+    },
   });
+});
+
+test("reviewer identity is derived from runtime configuration", () => {
+  assert.deepEqual(
+    reviewerIdentity({
+      REVIEWER_NAME: "Varuni Patel",
+      REVIEWER_ROLE: "Senior Reviewer",
+    }),
+    {
+      name: "Varuni Patel",
+      role: "Senior Reviewer",
+      initials: "VP",
+    },
+  );
+});
+
+test("corrected job filter returns only jobs with manual annotation prefixes", async () => {
+  resetCachesForTests();
+  const modified = new Date("2026-09-23T08:00:00.000Z");
+  const responses = {
+    "jobs/job-corrected/response.json": {
+      status: "COMPLETED",
+      source_key: "storage/uploads/corrected.mp4",
+      results: [],
+    },
+  };
+  const s3 = {
+    async send(command) {
+      const { Key, Prefix } = command.input;
+      if (command.constructor.name === "ListObjectsV2Command") {
+        if (Prefix === "manual-annotations/") {
+          return {
+            CommonPrefixes: [
+              { Prefix: "manual-annotations/job-corrected/" },
+            ],
+            IsTruncated: false,
+          };
+        }
+        if (Prefix === "jobs/") {
+          return {
+            Contents: [
+              {
+                Key: "jobs/job-corrected/response.json",
+                LastModified: modified,
+              },
+              {
+                Key: "jobs/job-untouched/response.json",
+                LastModified: modified,
+              },
+            ],
+            IsTruncated: false,
+          };
+        }
+        return { Contents: [], IsTruncated: false };
+      }
+      if (command.constructor.name === "GetObjectCommand" && responses[Key]) {
+        const data = Buffer.from(JSON.stringify(responses[Key]));
+        return {
+          Body: {
+            async transformToByteArray() {
+              return data;
+            },
+          },
+        };
+      }
+      if (
+        command.constructor.name === "HeadObjectCommand" &&
+        Key === "storage/uploads/corrected.mp4"
+      ) {
+        return { ETag: '"source"' };
+      }
+      throw missingError();
+    },
+  };
+
+  const result = await getJobs(
+    { range: "all", limit: 25, filter: "corrected" },
+    { s3 },
+  );
+  assert.equal(result.total_count, 1);
+  assert.equal(result.jobs.length, 1);
+  assert.equal(result.jobs[0].id, "job-corrected");
+  assert.equal(result.jobs[0].has_corrections, true);
+});
+
+test("reviewable job filter paginates only jobs with supported source videos", async () => {
+  resetCachesForTests();
+  const modified = new Date("2026-09-23T08:00:00.000Z");
+  const responseKey = "jobs/job-reviewable/response.json";
+  const sourceKey = "storage/uploads/UNASSIGNED_job-reviewable.mp4";
+  const s3 = {
+    async send(command) {
+      const { Key, Prefix } = command.input;
+      if (command.constructor.name === "ListObjectsV2Command") {
+        if (Prefix === "manual-annotations/") {
+          return { CommonPrefixes: [], IsTruncated: false };
+        }
+        if (Prefix === "storage/uploads/UNASSIGNED_") {
+          return {
+            Contents: [{ Key: sourceKey }],
+            IsTruncated: false,
+          };
+        }
+        if (Prefix === "storage/UNASSIGNED/uploads/") {
+          return { Contents: [], IsTruncated: false };
+        }
+        if (Prefix === "jobs/") {
+          return {
+            Contents: [
+              { Key: responseKey, LastModified: modified },
+              {
+                Key: "jobs/job-unavailable/response.json",
+                LastModified: modified,
+              },
+            ],
+            IsTruncated: false,
+          };
+        }
+        return { Contents: [], IsTruncated: false };
+      }
+      if (command.constructor.name === "GetObjectCommand" && Key === responseKey) {
+        const data = Buffer.from(
+          JSON.stringify({ status: "COMPLETED", source_key: sourceKey, results: [] }),
+        );
+        return {
+          Body: {
+            async transformToByteArray() {
+              return data;
+            },
+          },
+        };
+      }
+      if (command.constructor.name === "HeadObjectCommand" && Key === sourceKey) {
+        return { ETag: '"source"' };
+      }
+      throw missingError();
+    },
+  };
+
+  const result = await getJobs(
+    { range: "all", limit: 25, filter: "reviewable" },
+    { s3 },
+  );
+  assert.equal(result.total_count, 1);
+  assert.equal(result.jobs.length, 1);
+  assert.equal(result.jobs[0].id, "job-reviewable");
+  assert.equal(result.jobs[0].source_available, true);
 });

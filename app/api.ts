@@ -5,6 +5,13 @@ export type Health = {
   bucket: string;
   region: string;
   account: string;
+  reviewer: ReviewerIdentity;
+};
+
+export type ReviewerIdentity = {
+  name: string;
+  role: string;
+  initials: string;
 };
 
 export type JobSummary = {
@@ -18,6 +25,7 @@ export type JobSummary = {
   workflows: string[];
   preview_available: boolean;
   source_available: boolean;
+  has_corrections: boolean;
   preview_tone: number;
   preferred_batch_size?: number;
   failure_summary?: string | null;
@@ -109,14 +117,16 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       ...init,
       headers: { "Content-Type": "application/json", ...init?.headers },
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw error;
     throw new Error("The dashboard route could not be reached");
   }
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     if (response.status === 503)
       throw new Error(
-        "AWS access is unavailable. Refresh the SSO session and retry",
+        body.detail ??
+          "AWS access is unavailable. Refresh the SSO session and retry",
       );
     if (response.status === 403)
       throw new Error(

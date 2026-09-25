@@ -51,6 +51,7 @@ import {
   Segment,
 } from "./api";
 import { adjacentFrame, frameWindow, mergeFrameNumbers } from "./frame-filter.mjs";
+import { ReviewerBadge } from "./reviewer-identity";
 
 type VisibleModel = FrameModel & { visible: boolean };
 type DragMode = "move" | "nw" | "ne" | "sw" | "se";
@@ -61,7 +62,7 @@ type FrameDraft = {
   segments: Segment[];
 };
 type PendingNavigation = { run: () => void } | null;
-type JobFilter = "all" | "reviewable" | "unavailable";
+type JobFilter = "all" | "reviewable" | "corrected" | "unavailable";
 type FrameFilter = "all" | "corrected";
 
 const FULL_JOB_PRELOAD_LIMIT = 100;
@@ -175,6 +176,7 @@ export function ReviewDashboard({
   const warmingBatchesRef = useRef<Set<number>>(new Set());
   const preloadGenerationRef = useRef(0);
   const currentImageKeyRef = useRef("");
+  const exactFrameControllerRef = useRef<AbortController | null>(null);
 
   const sidebarSource = query.trim() ? searchJobs : queueJobs;
   const sidebarJobs = useMemo(
@@ -189,7 +191,9 @@ export function ReviewDashboard({
       jobFilter === "all" ||
       (jobFilter === "reviewable"
         ? item.source_available
-        : !item.source_available);
+        : jobFilter === "corrected"
+          ? item.has_corrections
+          : !item.source_available);
     return matchesQuery && matchesFilter;
   });
   const selected = annotations.find((item) => item.id === selectedId);
@@ -369,12 +373,17 @@ export function ReviewDashboard({
   }
 
   useEffect(() => {
+    exactFrameControllerRef.current?.abort();
+    exactFrameControllerRef.current = null;
     preloadGenerationRef.current += 1;
     loadedFrameImagesRef.current.clear();
     frameImagePromisesRef.current.clear();
     batchCacheRef.current.clear();
     warmingBatchesRef.current.clear();
     currentImageKeyRef.current = "";
+    return () => {
+      exactFrameControllerRef.current?.abort();
+    };
   }, [job.id]);
 
   useEffect(() => {
@@ -412,9 +421,6 @@ export function ReviewDashboard({
     const cached = batchCacheRef.current.get(batch);
     if (cached) {
       void (async () => {
-        await preloadFrameSet(cached);
-        await finishBatchPreparation();
-        if (cancelled) return;
         const index =
           batchTargetIndexRef.current === null
             ? batchEdgeRef.current === "last"
@@ -424,6 +430,11 @@ export function ReviewDashboard({
                 batchTargetIndexRef.current,
                 Math.max(0, cached.frames.length - 1),
               );
+        const targetFrame = cached.frames[index];
+        if (targetFrame)
+          await preloadFrameImage(cached, targetFrame.frame_number);
+        await finishBatchPreparation();
+        if (cancelled) return;
         setDetail(cached);
         setReviewedFrameNumbers((current) =>
           mergeFrameNumbers(current, cached.reviewed_frames),
@@ -433,27 +444,32 @@ export function ReviewDashboard({
         batchTargetIndexRef.current = null;
         setPreparingBatch(false);
         setLoading(false);
+        void preloadFrameSet(cached);
       })();
       return () => {
         cancelled = true;
       };
     }
+    const controller = new AbortController();
     api<JobDetail>(
       `/v1/jobs/${job.id}?batch=${batch}&size=${job.preferred_batch_size ?? 20}`,
+      { signal: controller.signal },
     )
       .then(async (result) => {
-        await preloadFrameSet(result);
+        const index =
+          batchTargetIndexRef.current === null
+            ? batchEdgeRef.current === "last"
+              ? Math.max(0, result.frames.length - 1)
+              : 0
+            : Math.min(
+                batchTargetIndexRef.current,
+                Math.max(0, result.frames.length - 1),
+              );
+        const targetFrame = result.frames[index];
+        if (targetFrame)
+          await preloadFrameImage(result, targetFrame.frame_number);
         await finishBatchPreparation();
         if (!cancelled) {
-          const index =
-            batchTargetIndexRef.current === null
-              ? batchEdgeRef.current === "last"
-                ? Math.max(0, result.frames.length - 1)
-                : 0
-              : Math.min(
-                  batchTargetIndexRef.current,
-                  Math.max(0, result.frames.length - 1),
-                );
           batchCacheRef.current.set(result.batch, result);
           setDetail(result);
           setReviewedFrameNumbers((current) =>
@@ -463,9 +479,11 @@ export function ReviewDashboard({
           batchEdgeRef.current = "first";
           batchTargetIndexRef.current = null;
           setPreparingBatch(false);
+          void preloadFrameSet(result);
         }
       })
       .catch((caught) => {
+        if (caught instanceof Error && caught.name === "AbortError") return;
         if (!cancelled) {
           setPreparingBatch(false);
           setImageLoading(false);
@@ -481,6 +499,7 @@ export function ReviewDashboard({
       });
     return () => {
       cancelled = true;
+      controller.abort();
     };
     // Batch and job identity intentionally control this request lifecycle.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -805,15 +824,80 @@ export function ReviewDashboard({
     applyFrame(index, detail);
   }
 
+  async function goToExactReviewFrame(
+    requested: number,
+    stageCurrent = true,
+  ) {
+    if (!detail || loading) return;
+    if (currentFrame?.frame_number === requested) return;
+    if (stageCurrent) stageCurrentFrame();
+    const localIndex = detail.frames.findIndex(
+      (frame) => frame.frame_number === requested,
+    );
+    if (localIndex >= 0) {
+      applyFrame(localIndex, detail);
+      return;
+    }
+
+    exactFrameControllerRef.current?.abort();
+    const controller = new AbortController();
+    exactFrameControllerRef.current = controller;
+    setPreparingBatch(true);
+    setImageLoading(true);
+    setLoading(true);
+    setError("");
+    try {
+      const result = await api<JobDetail>(
+        `/v1/jobs/${job.id}?frame=${requested}&size=${detail.batch_size}`,
+        { signal: controller.signal },
+      );
+      if (controller.signal.aborted) return;
+      const exactIndex = result.frames.findIndex(
+        (frame) => frame.frame_number === requested,
+      );
+      if (exactIndex < 0) throw new Error(`Frame ${requested} could not be loaded`);
+      batchCacheRef.current.set(result.batch, result);
+      setReviewedFrameNumbers((current) =>
+        mergeFrameNumbers(current, result.reviewed_frames),
+      );
+      if (result.batch === batch) {
+        setDetail(result);
+        applyFrame(exactIndex, result);
+        setPreparingBatch(false);
+        setLoading(false);
+      } else {
+        batchTargetIndexRef.current = exactIndex;
+        setBatch(result.batch);
+      }
+    } catch (caught) {
+      if (caught instanceof Error && caught.name === "AbortError") return;
+      setPreparingBatch(false);
+      setImageLoading(false);
+      setLoading(false);
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : `Frame ${requested} could not be loaded`,
+      );
+    } finally {
+      if (exactFrameControllerRef.current === controller)
+        exactFrameControllerRef.current = null;
+    }
+  }
+
+  function goToAdjacentCorrected(direction: -1 | 1) {
+    const target = adjacentFrame(
+      reviewedFrameNumbers,
+      currentFrame?.frame_number ?? -1,
+      direction,
+    );
+    if (target !== null) void goToExactReviewFrame(target);
+  }
+
   function goRelativeFrame(direction: -1 | 1) {
     if (!detail || loading) return;
     if (frameFilter === "corrected") {
-      const target = adjacentFrame(
-        reviewedFrameNumbers,
-        currentFrame?.frame_number ?? -1,
-        direction,
-      );
-      if (target !== null) goToSampledFrame(target);
+      goToAdjacentCorrected(direction);
       return;
     }
     const next = currentFrameIndex + direction;
@@ -872,7 +956,7 @@ export function ReviewDashboard({
       reviewedFrameNumbers.find(
         (frame) => frame > currentFrame.frame_number,
       ) ?? reviewedFrameNumbers[0];
-    goToSampledFrame(target);
+    void goToExactReviewFrame(target);
   }
 
   function changeFrameFilter(nextFilter: FrameFilter) {
@@ -885,7 +969,7 @@ export function ReviewDashboard({
       (!currentFrame ||
         !reviewedFrameNumbers.includes(currentFrame.frame_number))
     ) {
-      goToSampledFrame(reviewedFrameNumbers[0], false);
+      void goToExactReviewFrame(reviewedFrameNumbers[0], false);
     }
   }
 
@@ -1178,13 +1262,7 @@ export function ReviewDashboard({
         </div>
         <div className="topbar-status">
           <ConnectionState health={health} />
-          <div className="reviewer" aria-label="Current reviewer">
-            <div className="avatar" aria-hidden="true">PD</div>
-            <div>
-              <strong>Priyansh</strong>
-              <span>Reviewer</span>
-            </div>
-          </div>
+          <ReviewerBadge identity={health?.reviewer} />
         </div>
       </header>
       <aside className={`jobs-panel ${mobileJobs ? "jobs-panel-open" : ""}`}>
@@ -1253,6 +1331,15 @@ export function ReviewDashboard({
                   }}
                 >
                   Reviewable
+                </button>
+                <button
+                  className={jobFilter === "corrected" ? "active" : ""}
+                  onClick={() => {
+                    setJobFilter("corrected");
+                    setFilterOpen(false);
+                  }}
+                >
+                  Corrected
                 </button>
                 <button
                   className={jobFilter === "unavailable" ? "active" : ""}
@@ -1478,7 +1565,9 @@ export function ReviewDashboard({
                     }}
                     onError={() => {
                       setImageLoading(false);
-                      setError("The extracted frame image could not be loaded");
+                      setError(
+                        `Frame ${currentFrame?.frame_number ?? ""} could not be loaded. Retry the frame or continue reviewing another frame.`,
+                      );
                     }}
                   />
                 )}
@@ -1623,6 +1712,38 @@ export function ReviewDashboard({
                   <em>{reviewedFrameNumbers.length}</em>
                 </button>
               </div>
+              {frameFilter === "corrected" && reviewedFrameNumbers.length > 0 && (
+                <div className="corrected-shortcuts" aria-label="Corrected frame navigation">
+                  <button
+                    type="button"
+                    onClick={() => goToAdjacentCorrected(-1)}
+                    disabled={
+                      adjacentFrame(
+                        reviewedFrameNumbers,
+                        currentFrame?.frame_number ?? -1,
+                        -1,
+                      ) === null
+                    }
+                  >
+                    <ChevronLeft size={14} />
+                    Previous changed
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => goToAdjacentCorrected(1)}
+                    disabled={
+                      adjacentFrame(
+                        reviewedFrameNumbers,
+                        currentFrame?.frame_number ?? -1,
+                        1,
+                      ) === null
+                    }
+                  >
+                    Next changed
+                    <ChevronRight size={14} />
+                  </button>
+                </div>
+              )}
             </div>
             <div className="frame-strip">
               <button
@@ -1633,7 +1754,11 @@ export function ReviewDashboard({
                     ? currentCorrectedIndex <= 0
                     : currentFrameIndex === 0 && batch === 0
                 }
-                aria-label="Previous frame"
+                aria-label={
+                  frameFilter === "corrected"
+                    ? "Previous changed frame"
+                    : "Previous frame"
+                }
               >
                 <ArrowLeft size={17} />
               </button>
@@ -1694,7 +1819,7 @@ export function ReviewDashboard({
                       <button
                         key={frameNumber}
                         className={`frame-thumb ${currentFrame?.frame_number === frameNumber ? "frame-thumb-active" : ""} ${unsaved ? "frame-thumb-draft" : ""} ${saved ? "frame-thumb-reviewed" : ""}`}
-                        onClick={() => goToSampledFrame(frameNumber)}
+                        onClick={() => void goToExactReviewFrame(frameNumber)}
                         title={
                           unsaved
                             ? saved
@@ -1750,7 +1875,11 @@ export function ReviewDashboard({
                     : currentFrameIndex >= (detail?.frames.length ?? 1) - 1 &&
                       batch >= (detail?.total_batches ?? 1) - 1
                 }
-                aria-label="Next frame"
+                aria-label={
+                  frameFilter === "corrected"
+                    ? "Next changed frame"
+                    : "Next frame"
+                }
               >
                 <ArrowRight size={17} />
               </button>

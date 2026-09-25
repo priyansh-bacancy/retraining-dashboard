@@ -1,5 +1,5 @@
-import { createWriteStream } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, unlink } from "node:fs/promises";
+import { createWriteStream, rmSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -23,7 +23,10 @@ export const BUCKET =
   "icu-solarcam-storage-bacancy-ap-southeast-2";
 export const REGION = process.env.AWS_REGION ?? "ap-southeast-2";
 const SAMPLE_INTERVAL = Number(process.env.RETRAINING_SAMPLE_INTERVAL ?? 15);
-const CACHE_ROOT = join(tmpdir(), "icu-retraining-dashboard-node-cache");
+const CACHE_ROOT = join(
+  tmpdir(),
+  `icu-retraining-dashboard-node-cache-${process.pid}`,
+);
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const FFMPEG = ffmpegPath;
 const FFPROBE = ffprobeStatic.path;
@@ -73,16 +76,29 @@ class HttpError extends Error {
 
 const cache = {
   jobs: { at: 0, value: [] },
+  correctedJobs: { at: 0, value: new Set() },
+  reviewableJobs: { at: 0, value: new Set() },
   pages: new Map(),
   summaries: new Map(),
   jobsById: new Map(),
   health: { at: 0, value: null },
-  activeVideo: null,
-  activeVideoPromise: null,
-  activeBatch: null,
+  videos: new Map(),
+  videoPromises: new Map(),
+  batches: new Map(),
   frames: new Map(),
   previews: new Map(),
 };
+
+// Every process owns a unique cache folder, so a deployment cannot inherit an
+// active.mp4 created by another OS user. Synchronous exit cleanup is deliberate:
+// async work is not guaranteed to finish once Node's exit event starts.
+process.once("exit", () => {
+  try {
+    rmSync(CACHE_ROOT, { recursive: true, force: true });
+  } catch {
+    // /tmp cleanup is best-effort and must never interrupt shutdown.
+  }
+});
 const MAX_FRAME_BATCH_SIZE = 100;
 const FRAME_CACHE_LIMIT = 125;
 const VIDEO_SUFFIXES = [".mp4", ".webm", ".avi", ".mov", ".mkv", ".m4v"];
@@ -164,6 +180,80 @@ async function listKeys(s3, prefix) {
       : undefined;
   } while (continuationToken);
   return rows;
+}
+
+async function loadCorrectedJobIds(s3) {
+  if (fresh(cache.correctedJobs)) return cache.correctedJobs.value;
+  const jobIds = new Set();
+  let continuationToken;
+  do {
+    const response = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: BUCKET,
+        Prefix: "manual-annotations/",
+        Delimiter: "/",
+        ContinuationToken: continuationToken,
+      }),
+    );
+    for (const row of response.CommonPrefixes ?? []) {
+      const match = /^manual-annotations\/([^/]+)\/$/.exec(
+        String(row.Prefix ?? ""),
+      );
+      if (match && SAFE_ID.test(match[1])) jobIds.add(match[1]);
+    }
+    continuationToken = response.IsTruncated
+      ? response.NextContinuationToken
+      : undefined;
+  } while (continuationToken);
+  cache.correctedJobs = { at: Date.now(), value: jobIds };
+  return jobIds;
+}
+
+async function loadReviewableJobIds(s3) {
+  if (fresh(cache.reviewableJobs)) return cache.reviewableJobs.value;
+  const jobIds = new Set();
+  const layouts = [
+    {
+      prefix: "storage/uploads/UNASSIGNED_",
+      jobId(key) {
+        const fileName = key.slice(this.prefix.length).split("/")[0];
+        const suffix = extname(fileName).toLowerCase();
+        return VIDEO_SUFFIXES.includes(suffix)
+          ? fileName.slice(0, -suffix.length)
+          : "";
+      },
+    },
+    {
+      prefix: "storage/UNASSIGNED/uploads/",
+      jobId(key) {
+        const fileName = key.slice(this.prefix.length).split("/")[0];
+        const suffix = extname(fileName).toLowerCase();
+        return VIDEO_SUFFIXES.includes(suffix)
+          ? fileName.slice(0, -suffix.length)
+          : "";
+      },
+    },
+  ];
+  for (const layout of layouts) {
+    for (const row of await listKeys(s3, layout.prefix)) {
+      const jobId = layout.jobId(String(row.Key ?? ""));
+      if (SAFE_ID.test(jobId)) jobIds.add(jobId);
+    }
+  }
+  cache.reviewableJobs = { at: Date.now(), value: jobIds };
+  return jobIds;
+}
+
+export function reviewerIdentity(environment = process.env) {
+  const name = String(environment.REVIEWER_NAME ?? "Review Team").trim() ||
+    "Review Team";
+  const role = String(environment.REVIEWER_ROLE ?? "Reviewer").trim() ||
+    "Reviewer";
+  const words = name.split(/\s+/).filter(Boolean);
+  const initials = `${words[0]?.[0] ?? "R"}${words.length > 1 ? words.at(-1)[0] : ""}`
+    .toUpperCase()
+    .slice(0, 2);
+  return { name, role, initials };
 }
 
 export function encodePageCursor(offset) {
@@ -486,6 +576,29 @@ export function selectBatch(numbers, batch, size) {
   };
 }
 
+export function selectRequestedBatch(numbers, batch, size, requestedFrame) {
+  let resolvedBatch = batch;
+  if (
+    requestedFrame !== undefined &&
+    requestedFrame !== null &&
+    requestedFrame !== ""
+  ) {
+    const frame = Number(requestedFrame);
+    if (!Number.isInteger(frame) || frame < 0) {
+      throw new HttpError(422, "Invalid frame number");
+    }
+    const frameIndex = numbers.indexOf(frame);
+    if (frameIndex < 0) {
+      throw new HttpError(404, `Frame ${frame} is not in this job's review set`);
+    }
+    resolvedBatch = Math.floor(frameIndex / size);
+  }
+  return {
+    batch: resolvedBatch,
+    ...selectBatch(numbers, resolvedBatch, size),
+  };
+}
+
 function runProcess(executable, args, { collectStdout = false } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
@@ -518,42 +631,36 @@ async function ensureCacheRoot() {
 }
 
 async function ensureVideo(s3, jobId, sourceKey) {
-  if (
-    cache.activeVideo?.jobId === jobId &&
-    cache.activeVideo?.sourceKey === sourceKey
-  ) {
-    return cache.activeVideo.path;
-  }
-  if (
-    cache.activeVideoPromise?.jobId === jobId &&
-    cache.activeVideoPromise?.sourceKey === sourceKey
-  ) {
-    return cache.activeVideoPromise.promise;
-  }
+  const cacheKey = `${jobId}\0${sourceKey}`;
+  const cached = cache.videos.get(cacheKey);
+  if (cached) return cached.path;
+  const pending = cache.videoPromises.get(cacheKey);
+  if (pending) return pending;
   const promise = (async () => {
-    await mkdir(CACHE_ROOT, { recursive: true });
+    await ensureCacheRoot();
+    const folder = await mkdtemp(join(CACHE_ROOT, `${jobId}-`));
     const suffix = extname(sourceKey) || ".mp4";
-    const path = join(CACHE_ROOT, `active${suffix}`);
-    for (const name of await readdir(CACHE_ROOT)) {
-      if (name.startsWith("active.") && join(CACHE_ROOT, name) !== path) {
-        await unlink(join(CACHE_ROOT, name)).catch(() => {});
-      }
+    const path = join(folder, `source${suffix}`);
+    try {
+      const response = await s3.send(
+        new GetObjectCommand({ Bucket: BUCKET, Key: sourceKey }),
+      );
+      if (!response.Body)
+        throw new HttpError(404, "The source video has no body");
+      await pipeline(response.Body, createWriteStream(path));
+      cache.videos.set(cacheKey, { jobId, sourceKey, path, folder });
+      cache.batches.delete(jobId);
+      return path;
+    } catch (error) {
+      await rm(folder, { recursive: true, force: true }).catch(() => {});
+      throw error;
     }
-    const response = await s3.send(
-      new GetObjectCommand({ Bucket: BUCKET, Key: sourceKey }),
-    );
-    if (!response.Body) throw new HttpError(404, "The source video has no body");
-    await pipeline(response.Body, createWriteStream(path));
-    cache.activeVideo = { jobId, sourceKey, path };
-    cache.frames.clear();
-    cache.activeBatch = null;
-    return path;
   })();
-  cache.activeVideoPromise = { jobId, sourceKey, promise };
+  cache.videoPromises.set(cacheKey, promise);
   try {
     return await promise;
   } finally {
-    cache.activeVideoPromise = null;
+    cache.videoPromises.delete(cacheKey);
   }
 }
 
@@ -612,7 +719,7 @@ async function primeFrameBatch(s3, jobId, sourceKey, numbers) {
   if (!wanted.length) return;
   const signature = `${jobId}:${wanted.join(",")}`;
   if (
-    cache.activeBatch === signature &&
+    cache.batches.get(jobId) === signature &&
     wanted.every((frame) => cache.frames.has(`${jobId}\0${frame}`))
   ) {
     return;
@@ -645,7 +752,7 @@ async function primeFrameBatch(s3, jobId, sourceKey, numbers) {
     for (let index = 0; index < wanted.length; index += 1) {
       rememberFrame(jobId, wanted[index], await readFile(join(outputDirectory, files[index])));
     }
-    cache.activeBatch = signature;
+    cache.batches.set(jobId, signature);
   } finally {
     await rm(outputDirectory, { recursive: true, force: true });
   }
@@ -1054,17 +1161,22 @@ function dateQuery(value, label) {
   return date;
 }
 
-function cacheKeyForPage(query) {
+export function cacheKeyForPage(query) {
   return JSON.stringify([
     query.range,
     query.start ?? null,
     query.end ?? null,
     query.limit,
     query.continuation_token ?? null,
+    query.filter ?? "all",
   ]);
 }
 
-export async function getHealth({ s3 = defaultClients.s3, sts = defaultClients.sts } = {}) {
+export async function getHealth({
+  s3 = defaultClients.s3,
+  sts = defaultClients.sts,
+  environment = process.env,
+} = {}) {
   await ensureCacheRoot();
   if (fresh(cache.health)) return cache.health.value;
   try {
@@ -1077,6 +1189,7 @@ export async function getHealth({ s3 = defaultClients.s3, sts = defaultClients.s
       bucket: BUCKET,
       region: REGION,
       account: identity.Account,
+      reviewer: reviewerIdentity(environment),
     };
     cache.health = { at: Date.now(), value };
     return value;
@@ -1111,6 +1224,13 @@ export async function getJobs(query = {}, { s3 = defaultClients.s3 } = {}) {
       rangeStart = new Date(Date.now() - hours * 3_600_000);
     }
     const search = String(query.search ?? "").trim();
+    const filter = String(query.filter ?? "all");
+    if (!new Set(["all", "reviewable", "corrected"]).has(filter)) {
+      throw new HttpError(422, "Invalid job filter");
+    }
+    const correctedJobIds = await loadCorrectedJobIds(s3);
+    const reviewableJobIds =
+      filter === "reviewable" ? await loadReviewableJobIds(s3) : null;
     if (search) {
       if (SAFE_ID.test(search)) {
         try {
@@ -1131,8 +1251,26 @@ export async function getJobs(query = {}, { s3 = defaultClients.s3 } = {}) {
               time: humanAge(modified),
               preview_tone: 0,
             });
+            if (filter === "corrected" && !correctedJobIds.has(job.id)) {
+              return {
+                jobs: [],
+                count: 0,
+                total_count: 0,
+                limit,
+                next_continuation_token: null,
+              };
+            }
+            if (filter === "reviewable" && !job.source_available) {
+              return {
+                jobs: [],
+                count: 0,
+                total_count: 0,
+                limit,
+                next_continuation_token: null,
+              };
+            }
             return {
-              jobs: [job],
+              jobs: [{ ...job, has_corrections: correctedJobIds.has(job.id) }],
               count: 1,
               total_count: 1,
               limit,
@@ -1160,7 +1298,9 @@ export async function getJobs(query = {}, { s3 = defaultClients.s3 } = {}) {
         const captured = new Date(job.captured);
         return (
           (!rangeStart || captured >= rangeStart) &&
-          (!rangeEnd || captured <= rangeEnd)
+          (!rangeEnd || captured <= rangeEnd) &&
+          (filter !== "corrected" || correctedJobIds.has(job.id)) &&
+          (filter !== "reviewable" || reviewableJobIds.has(job.id))
         );
       })
       .sort((left, right) => right.captured.localeCompare(left.captured));
@@ -1173,7 +1313,12 @@ export async function getJobs(query = {}, { s3 = defaultClients.s3 } = {}) {
         throw error;
       }
     });
-    const visible = hydrated.filter(Boolean);
+    const visible = hydrated
+      .filter(Boolean)
+      .map((job) => ({
+        ...job,
+        has_corrections: correctedJobIds.has(job.id),
+      }));
     const nextOffset = offset + rows.length;
     const value = {
       jobs: visible,
@@ -1203,8 +1348,9 @@ export async function getJobDetail(jobIdValue, query = {}, { s3 = defaultClients
     const metadata = await videoMetadata(s3, jobId, response.source_key);
     const labels = await buildLabelIndex(s3, jobId);
     const numbers = completeFrameNumbers(response, labels, metadata.frame_count);
-    const { selected, totalBatches } = selectBatch(numbers, batch, size);
-    if (batch >= totalBatches) {
+    const selection = selectRequestedBatch(numbers, batch, size, query.frame);
+    const { selected, totalBatches } = selection;
+    if (selection.batch >= totalBatches) {
       throw new HttpError(404, "The requested frame batch does not exist");
     }
     await primeFrameBatch(s3, jobId, response.source_key, selected);
@@ -1218,7 +1364,7 @@ export async function getJobDetail(jobIdValue, query = {}, { s3 = defaultClients
       source_etag: response.source_etag,
       metadata,
       total_frames: numbers.length,
-      batch,
+      batch: selection.batch,
       sample_interval: sampleInterval(response),
       reviewed_frames: reviewedFrames,
       batch_size: size,
@@ -1341,6 +1487,11 @@ export async function saveFrameCorrections(jobIdValue, frameNumberValue, body, {
       frameNumber,
       body?.corrections ?? [],
     );
+    if (written.length) {
+      cache.correctedJobs.value.add(jobId);
+      cache.correctedJobs.at = Date.now();
+      cache.pages.clear();
+    }
     cache.jobsById.delete(jobId);
     return { saved: true, written };
 }
@@ -1372,6 +1523,7 @@ export async function saveBatchCorrections(jobIdValue, body, { s3 = defaultClien
           frameNumber,
           frame.corrections ?? [],
         );
+        if (written.length) cache.correctedJobs.value.add(jobId);
         results.push({ frame_number: frameNumber, saved: true, written });
       } catch (error) {
         results.push({
@@ -1382,6 +1534,8 @@ export async function saveBatchCorrections(jobIdValue, body, { s3 = defaultClien
       }
     }
     cache.jobsById.delete(jobId);
+    cache.correctedJobs.at = Date.now();
+    cache.pages.clear();
     const failedCount = results.filter((result) => !result.saved).length;
     return {
       saved: failedCount === 0,
@@ -1410,6 +1564,21 @@ export async function routeResponse(operation) {
         { status: 503 },
       );
     }
+    if (error.code === "EACCES" || error.code === "EPERM") {
+      return Response.json(
+        {
+          detail:
+            "The dashboard frame cache is not writable. Restart the service with a writable temporary directory.",
+        },
+        { status: 503 },
+      );
+    }
+    if (error.code === "ENOSPC") {
+      return Response.json(
+        { detail: "The server has insufficient temporary disk space for video frames." },
+        { status: 507 },
+      );
+    }
     console.error("Dashboard route failed", error);
     return Response.json(
       { detail: error.message ?? "Dashboard API failed" },
@@ -1420,13 +1589,15 @@ export async function routeResponse(operation) {
 
 export function resetCachesForTests() {
   cache.jobs = { at: 0, value: [] };
+  cache.correctedJobs = { at: 0, value: new Set() };
+  cache.reviewableJobs = { at: 0, value: new Set() };
   cache.pages.clear();
   cache.summaries.clear();
   cache.jobsById.clear();
   cache.health = { at: 0, value: null };
-  cache.activeVideo = null;
-  cache.activeVideoPromise = null;
-  cache.activeBatch = null;
+  cache.videos.clear();
+  cache.videoPromises.clear();
+  cache.batches.clear();
   cache.frames.clear();
   cache.previews.clear();
 }

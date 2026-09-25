@@ -19,6 +19,9 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { API_BASE, api, Health, JobsPage, JobSummary, rangeCode } from "./api";
 import { ReviewDashboard } from "./review-dashboard";
+import { ReviewerBadge } from "./reviewer-identity";
+
+type JobView = "all" | "reviewable" | "corrected";
 
 export function DashboardApp() {
   const [selectedJob, setSelectedJob] = useState<JobSummary | null>(null);
@@ -85,7 +88,7 @@ function JobsLanding({
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [reviewableOnly, setReviewableOnly] = useState(false);
+  const [jobView, setJobView] = useState<JobView>("all");
 
   useEffect(() => {
     let cancelled = false;
@@ -98,6 +101,7 @@ function JobsLanding({
             range: rangeCode(range),
             limit: "25",
             search: query,
+            filter: jobView,
           });
           if (cursor) params.set("continuation_token", cursor);
           if (range === "Custom range") {
@@ -141,7 +145,7 @@ function JobsLanding({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [query, range, customStart, customEnd, cursor, setHealth, setJobs]);
+  }, [query, range, customStart, customEnd, cursor, jobView, setHealth, setJobs]);
 
   function resetPage() {
     setCursor("");
@@ -150,6 +154,10 @@ function JobsLanding({
   }
   function chooseRange(value: string) {
     setRange(value);
+    resetPage();
+  }
+  function chooseJobView(value: JobView) {
+    setJobView(value);
     resetPage();
   }
   function nextPage() {
@@ -166,11 +174,7 @@ function JobsLanding({
     setPage((value) => Math.max(1, value - 1));
   }
 
-  const displayedJobs = useMemo(
-    () =>
-      reviewableOnly ? jobs.filter((job) => job.source_available) : jobs,
-    [jobs, reviewableOnly],
-  );
+  const displayedJobs = jobs;
   const totals = useMemo(
     () => ({
       models: displayedJobs.reduce(
@@ -198,13 +202,7 @@ function JobsLanding({
         </div>
         <div className="topbar-status">
           <ConnectionState health={health} />
-          <div className="reviewer" aria-label="Current reviewer">
-            <div className="avatar" aria-hidden="true">PD</div>
-            <div>
-              <strong>Priyansh</strong>
-              <span>Reviewer</span>
-            </div>
-          </div>
+          <ReviewerBadge identity={health?.reviewer} />
         </div>
       </header>
       <section className="jobs-home-content">
@@ -341,8 +339,18 @@ function JobsLanding({
         <section className="jobs-table-card">
           <div className="jobs-table-header">
             <div>
-              <h2>{reviewableOnly ? "Reviewable jobs" : "All jobs"}</h2>
-              <p>Showing up to 25 jobs from the selected period.</p>
+              <h2>
+                {jobView === "corrected"
+                  ? "Corrected jobs"
+                  : jobView === "reviewable"
+                    ? "Reviewable jobs"
+                    : "All jobs"}
+              </h2>
+              <p>
+                {jobView === "corrected"
+                  ? "Jobs containing saved reviewer corrections."
+                  : "Showing up to 25 jobs from the selected period."}
+              </p>
             </div>
             <div className="jobs-controls">
               <label className="search-field home-search">
@@ -357,14 +365,31 @@ function JobsLanding({
                   aria-label="Search jobs"
                 />
               </label>
-              <button
-                className={`filter-button ${reviewableOnly ? "filter-button-active" : ""}`}
-                aria-pressed={reviewableOnly}
-                onClick={() => setReviewableOnly((value) => !value)}
-              >
-                <Filter size={15} />
-                Reviewable{reviewableOnly && <span>On</span>}
-              </button>
+              <div className="jobs-view-filter" role="group" aria-label="Filter jobs">
+                <Filter size={14} aria-hidden="true" />
+                <button
+                  className={jobView === "all" ? "active" : ""}
+                  aria-pressed={jobView === "all"}
+                  onClick={() => chooseJobView("all")}
+                >
+                  All
+                </button>
+                <button
+                  className={jobView === "reviewable" ? "active" : ""}
+                  aria-pressed={jobView === "reviewable"}
+                  onClick={() => chooseJobView("reviewable")}
+                >
+                  Reviewable
+                </button>
+                <button
+                  className={jobView === "corrected" ? "active" : ""}
+                  aria-pressed={jobView === "corrected"}
+                  onClick={() => chooseJobView("corrected")}
+                >
+                  <CheckCircle2 size={13} />
+                  Corrected
+                </button>
+              </div>
             </div>
           </div>
           <div className="jobs-table-labels">
@@ -440,6 +465,12 @@ function JobsLanding({
                     </small>
                   </span>
                   <span className="workflow-tags">
+                    {job.has_corrections && (
+                      <i className="tag-corrected">
+                        <CheckCircle2 size={10} />
+                        Corrected
+                      </i>
+                    )}
                     {job.workflows.map((workflow) => (
                       <i
                         key={workflow}
@@ -478,8 +509,16 @@ function JobsLanding({
             {!loading && !error && displayedJobs.length === 0 && (
               <div className="no-jobs">
                 <Search size={22} />
-                <strong>No matching S3 jobs found</strong>
-                <span>Try a wider time period or show unavailable jobs.</span>
+                <strong>
+                  {jobView === "corrected"
+                    ? "No corrected jobs found"
+                    : "No matching S3 jobs found"}
+                </strong>
+                <span>
+                  {jobView === "corrected"
+                    ? "Save a frame correction or select a wider time period."
+                    : "Try a wider time period or another job filter."}
+                </span>
               </div>
             )}
           </div>

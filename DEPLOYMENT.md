@@ -62,6 +62,8 @@ PORT=3000
 AWS_REGION=ap-southeast-2
 RETRAINING_BUCKET=icu-solarcam-storage-bacancy-ap-southeast-2
 RETRAINING_SAMPLE_INTERVAL=15
+REVIEWER_NAME=Review Team
+REVIEWER_ROLE=Reviewer
 EOF
 sudo chmod 600 /etc/icu-retraining-dashboard.env
 ```
