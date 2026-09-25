@@ -13,7 +13,9 @@ import {
   resolveSourceKey,
   resultKind,
   reviewerIdentity,
+  routeResponse,
   selectBatch,
+  selectRequestedBatch,
   writeFrameCorrections,
 } from "./dashboard-api.mjs";
 
@@ -35,6 +37,29 @@ test("cursor and frame batching remain compatible with the dashboard", () => {
     selected: [75, 90, 105],
     totalBatches: 2,
   });
+});
+
+test("an exact corrected frame resolves to its real sorted batch", () => {
+  const numbers = [0, 15, 30, 41, 45, 60, 75];
+  assert.deepEqual(selectRequestedBatch(numbers, 0, 3, 41), {
+    batch: 1,
+    selected: [41, 45, 60],
+    totalBatches: 3,
+  });
+  assert.throws(
+    () => selectRequestedBatch(numbers, 0, 3, 42),
+    /not in this job's review set/,
+  );
+});
+
+test("filesystem cache permission errors return an actionable service message", async () => {
+  const response = await routeResponse(async () => {
+    const error = new Error("permission denied");
+    error.code = "EACCES";
+    throw error;
+  });
+  assert.equal(response.status, 503);
+  assert.match((await response.json()).detail, /frame cache is not writable/i);
 });
 
 test("job page cache keeps all, reviewable, and corrected filters separate", () => {
