@@ -64,6 +64,8 @@ RETRAINING_BUCKET=icu-solarcam-storage-bacancy-ap-southeast-2
 RETRAINING_SAMPLE_INTERVAL=15
 REVIEWER_NAME=Review Team
 REVIEWER_ROLE=Reviewer
+ANNOTATION_LEGACY_READ=true
+ANNOTATION_LEGACY_WRITE=true
 EOF
 sudo chmod 600 /etc/icu-retraining-dashboard.env
 ```
@@ -173,3 +175,31 @@ curl --fail http://127.0.0.1:3000/api/health
 
 The deployment is healthy when `/api/health` returns HTTP `200` and reports the
 expected AWS account, region, and S3 bucket.
+
+## 7. Migrate existing manual annotations
+
+The application reads both legacy job-first objects and the model-first
+layout. Preview migration counts before writing anything:
+
+```bash
+npm run annotations:migrate
+```
+
+Apply the copy, upgrade metadata to schema version 2, create model/job
+manifests, and verify every destination object:
+
+```bash
+npm run annotations:migrate:apply
+```
+
+This command is idempotent and never deletes legacy objects. Do not remove the
+legacy `manual-annotations/<job-id>/` paths until production reads, corrected
+filters, and model-wise retraining inputs have been independently validated.
+
+Migration modes:
+
+1. During backfill, keep both values `true` for dual read/write behavior.
+2. After verification, set `ANNOTATION_LEGACY_WRITE=false` to stop recreating
+   legacy objects while retaining read fallback.
+3. Only after the approved legacy retirement, also set
+   `ANNOTATION_LEGACY_READ=false` and restart the service.

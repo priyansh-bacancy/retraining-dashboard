@@ -9,6 +9,7 @@ import {
   getHealth,
   getJobs,
   frameReview,
+  manualModelCatalog,
   resetCachesForTests,
   resolveSourceKey,
   resultKind,
@@ -18,6 +19,14 @@ import {
   selectRequestedBatch,
   writeFrameCorrections,
 } from "./dashboard-api.mjs";
+import {
+  legacyLabelKey,
+  legacyMetadataKey,
+  modelLabelKey,
+  modelManifestKey,
+  modelMetadataKey,
+  sharedImageKey,
+} from "./annotation-storage.mjs";
 
 function missingError() {
   const error = new Error("missing");
@@ -78,6 +87,18 @@ test("model workflow kinds preserve MMC and aggression handling", () => {
   assert.equal(resultKind("group-detection"), "group");
   assert.equal(resultKind("mmc-vehicle-classification"), "vehicle");
   assert.equal(resultKind("videomae-aggression"), "segment");
+});
+
+test("manual model catalogue exposes phone usage classes and every editor kind", () => {
+  const catalog = manualModelCatalog();
+  const phone = catalog.find((model) => model.id === "phone-usage-detection");
+  assert.deepEqual(phone.classes, ["in_hand", "on_ear"]);
+  assert.equal(phone.kind, "box");
+  assert.equal(phone.manual_enabled, true);
+  assert.ok(catalog.some((model) => model.kind === "people"));
+  assert.ok(catalog.some((model) => model.kind === "group"));
+  assert.ok(catalog.some((model) => model.kind === "vehicle"));
+  assert.ok(catalog.some((model) => model.kind === "segment"));
 });
 
 test("people and group results use best-frame fallback and preserve semantic counts", async () => {
@@ -181,12 +202,21 @@ test("failed model results remain empty editable manual layers", async () => {
     { fps: 25, width: 1280, height: 720 },
     new Map(),
   );
-  assert.equal(review.models.length, 2);
-  assert.deepEqual(review.models[0].classes, ["in_hand", "on_ear"]);
-  assert.equal(review.models[0].status, "FAILED");
-  assert.deepEqual(review.models[0].annotations, []);
-  assert.equal(review.models[1].kind, "segment");
-  assert.deepEqual(review.models[1].segments, []);
+  const phone = review.models.find(
+    (model) => model.id === "phone-usage-detection",
+  );
+  const aggression = review.models.find(
+    (model) => model.id === "videomae-aggression",
+  );
+  const fall = review.models.find((model) => model.id === "fall-detection");
+  assert.deepEqual(phone.classes, ["in_hand", "on_ear"]);
+  assert.equal(phone.status, "FAILED");
+  assert.equal(phone.source, "model_output");
+  assert.deepEqual(phone.annotations, []);
+  assert.equal(aggression.kind, "segment");
+  assert.deepEqual(aggression.segments, []);
+  assert.equal(fall.status, "MANUAL_ONLY");
+  assert.equal(fall.source, "manual_available");
 });
 
 test("manual correction writes preserve MMC metadata and multiple aggression segments", async () => {
@@ -235,14 +265,53 @@ test("manual correction writes preserve MMC metadata and multiple aggression seg
     },
   ]);
 
-  assert.equal(written.length, 5);
+  assert.equal(written.length, 12);
+  assert.ok(written.includes(sharedImageKey("job-1", 30)));
+  assert.ok(
+    written.includes(
+      modelLabelKey("mmc-vehicle-classification", "job-1", 30),
+    ),
+  );
+  assert.ok(
+    written.includes(
+      legacyLabelKey("job-1", "mmc-vehicle-classification", 30),
+    ),
+  );
+  assert.ok(
+    written.includes(
+      legacyMetadataKey("job-1", "mmc-vehicle-classification", 30),
+    ),
+  );
+  const manifestWrite = commands.find(
+    (command) =>
+      command.constructor.name === "PutObjectCommand" &&
+      command.input.Key ===
+        modelManifestKey("mmc-vehicle-classification", "job-1"),
+  );
+  const manifest = JSON.parse(manifestWrite.input.Body);
+  assert.equal(manifest.frames["30"].review_status, "corrected");
   const metadataWrites = commands.filter(
     (command) =>
       command.constructor.name === "PutObjectCommand" &&
       command.input.Key.includes("/metadata/"),
   );
-  const mmc = JSON.parse(metadataWrites[0].input.Body);
-  const aggression = JSON.parse(metadataWrites[1].input.Body);
+  const mmc = JSON.parse(
+    metadataWrites.find(
+      (command) =>
+        command.input.Key ===
+        modelMetadataKey("mmc-vehicle-classification", "job-1", 30),
+    ).input.Body,
+  );
+  const aggression = JSON.parse(
+    metadataWrites.find(
+      (command) =>
+        command.input.Key ===
+        modelMetadataKey("videomae-aggression", "job-1", 30),
+    ).input.Body,
+  );
+  assert.equal(mmc.schema_version, 2);
+  assert.equal(mmc.job_id, "job-1");
+  assert.equal(mmc.image_key, sharedImageKey("job-1", 30));
   assert.equal(mmc.annotations[0].track_id, 42);
   assert.equal(mmc.annotations[0].attributes.color.label, "blue");
   assert.equal(aggression.segments.length, 2);
@@ -287,7 +356,8 @@ test("manual group corrections preserve people count metadata", async () => {
   const metadataWrite = commands.find(
     (command) =>
       command.constructor.name === "PutObjectCommand" &&
-      command.input.Key.includes("/metadata/group-detection/"),
+      command.input.Key ===
+        modelMetadataKey("group-detection", "job-groups", 15),
   );
   const metadata = JSON.parse(metadataWrite.input.Body);
   assert.equal(metadata.kind, "group");
@@ -321,12 +391,117 @@ test("manual people count is stored even when no person boxes are drawn", async 
   const metadataWrite = commands.find(
     (command) =>
       command.constructor.name === "PutObjectCommand" &&
-      command.input.Key.includes("/metadata/people-count/"),
+      command.input.Key === modelMetadataKey("people-count", "job-people", 30),
   );
   const metadata = JSON.parse(metadataWrite.input.Body);
   assert.equal(metadata.kind, "people");
   assert.equal(metadata.people_count, 7);
   assert.deepEqual(metadata.annotations, []);
+  const manifestWrite = commands.find(
+    (command) =>
+      command.constructor.name === "PutObjectCommand" &&
+      command.input.Key === modelManifestKey("people-count", "job-people"),
+  );
+  const manifest = JSON.parse(manifestWrite.input.Body);
+  assert.equal(manifest.frames["30"].review_status, "corrected");
+});
+
+test("empty manual overrides remain training-ready negative examples", async () => {
+  const commands = [];
+  const s3 = {
+    async send(command) {
+      commands.push(command);
+      if (command.constructor.name === "GetObjectCommand") {
+        if (!command.input.Key.endsWith(".jpg")) throw missingError();
+        return {
+          Body: {
+            async transformToByteArray() {
+              return Uint8Array.from([1, 2, 3]);
+            },
+          },
+        };
+      }
+      return {};
+    },
+  };
+  await writeFrameCorrections(s3, "job-empty", 45, [
+    { model_id: "phone-usage-detection", annotations: [] },
+  ]);
+  const metadataWrite = commands.find(
+    (command) =>
+      command.constructor.name === "PutObjectCommand" &&
+      command.input.Key ===
+        modelMetadataKey("phone-usage-detection", "job-empty", 45),
+  );
+  const manifestWrite = commands.find(
+    (command) =>
+      command.constructor.name === "PutObjectCommand" &&
+      command.input.Key ===
+        modelManifestKey("phone-usage-detection", "job-empty"),
+  );
+  assert.equal(JSON.parse(metadataWrite.input.Body).review_status, "reviewed_empty");
+  assert.equal(
+    JSON.parse(manifestWrite.input.Body).frames["45"].review_status,
+    "reviewed_empty",
+  );
+});
+
+test("model-first-only mode stops recreating legacy annotation objects", async () => {
+  const previousRead = process.env.ANNOTATION_LEGACY_READ;
+  const previousWrite = process.env.ANNOTATION_LEGACY_WRITE;
+  process.env.ANNOTATION_LEGACY_READ = "false";
+  process.env.ANNOTATION_LEGACY_WRITE = "false";
+  try {
+    const commands = [];
+    const s3 = {
+      async send(command) {
+        commands.push(command);
+        if (command.constructor.name === "GetObjectCommand") throw missingError();
+        return {};
+      },
+    };
+    const written = await writeFrameCorrections(s3, "job-new-only", 60, [
+      { model_id: "people-count", people_count: 3, annotations: [] },
+    ]);
+    assert.ok(written.includes(sharedImageKey("job-new-only", 60)));
+    assert.ok(
+      written.includes(modelLabelKey("people-count", "job-new-only", 60)),
+    );
+    assert.ok(
+      !written.includes(
+        legacyLabelKey("job-new-only", "people-count", 60),
+      ),
+    );
+    assert.ok(
+      !commands.some(
+        (command) =>
+          command.input?.Key ===
+          legacyMetadataKey("job-new-only", "people-count", 60),
+      ),
+    );
+  } finally {
+    if (previousRead === undefined) delete process.env.ANNOTATION_LEGACY_READ;
+    else process.env.ANNOTATION_LEGACY_READ = previousRead;
+    if (previousWrite === undefined) delete process.env.ANNOTATION_LEGACY_WRITE;
+    else process.env.ANNOTATION_LEGACY_WRITE = previousWrite;
+  }
+});
+
+test("unsupported manual model IDs are rejected before S3 is changed", async () => {
+  let calls = 0;
+  const s3 = {
+    async send() {
+      calls += 1;
+      return {};
+    },
+  };
+  await assert.rejects(
+    writeFrameCorrections(s3, "job-1", 30, [
+      { model_id: "unknown-model", annotations: [] },
+    ]),
+    /not available for manual annotation/,
+  );
+  assert.equal(calls, 0);
 });
 
 test("manual people count is restored independently from person boxes", async () => {
@@ -338,9 +513,14 @@ test("manual people count is restored independently from person boxes", async ()
   });
   const s3 = {
     async send(command) {
-      const bytes = command.input.Key.includes("/metadata/")
-        ? Buffer.from(metadata)
-        : Buffer.alloc(0);
+      const key = command.input.Key;
+      const bytes =
+        key === modelMetadataKey("people-count", "job-people", 30)
+          ? Buffer.from(metadata)
+          : key === modelLabelKey("people-count", "job-people", 30)
+            ? Buffer.alloc(0)
+            : null;
+      if (!bytes) throw missingError();
       return {
         Body: {
           async transformToByteArray() {
@@ -365,13 +545,81 @@ test("manual people count is restored independently from person boxes", async ()
           modelId: "people-count",
           frame: 30,
           manual: true,
-          key: "manual-annotations/job-people/labels/people-count/frame_000030.txt",
+          key: modelLabelKey("people-count", "job-people", 30),
         },
       ],
     ]),
   );
   assert.equal(review.models[0].people_count, 7);
   assert.deepEqual(review.models[0].annotations, []);
+});
+
+test("saved annotations restore a model that was never executed for the job", async () => {
+  const labelKey = modelLabelKey("phone-usage-detection", "job-manual", 30);
+  const metadataKey = modelMetadataKey(
+    "phone-usage-detection",
+    "job-manual",
+    30,
+  );
+  const metadata = {
+    model_id: "phone-usage-detection",
+    frame_number: 30,
+    annotations: [
+      {
+        id: "phone-1",
+        class_id: 0,
+        label: "in_hand",
+        confidence: 1,
+        x: 40,
+        y: 35,
+        width: 20,
+        height: 30,
+      },
+    ],
+  };
+  const s3 = {
+    async send(command) {
+      const key = command.input.Key;
+      const bytes =
+        key === labelKey
+          ? Buffer.from("0 0.500000 0.500000 0.200000 0.300000\n")
+          : key === metadataKey
+            ? Buffer.from(JSON.stringify(metadata))
+            : null;
+      if (!bytes) throw missingError();
+      return {
+        Body: {
+          async transformToByteArray() {
+            return bytes;
+          },
+        },
+      };
+    },
+  };
+  const review = await frameReview(
+    s3,
+    30,
+    { job_id: "job-manual", results: [] },
+    { fps: 25, width: 100, height: 100 },
+    new Map([
+      [
+        "phone-usage-detection\u000030",
+        {
+          modelId: "phone-usage-detection",
+          frame: 30,
+          manual: true,
+          key: labelKey,
+        },
+      ],
+    ]),
+  );
+  const phone = review.models.find(
+    (model) => model.id === "phone-usage-detection",
+  );
+  assert.equal(phone.status, "MANUAL_ONLY");
+  assert.equal(phone.source, "manual_saved");
+  assert.equal(phone.annotations.length, 1);
+  assert.equal(phone.annotations[0].label, "in_hand");
 });
 
 test("health service uses injected Node AWS clients", async () => {
@@ -472,6 +720,76 @@ test("corrected job filter returns only jobs with manual annotation prefixes", a
   assert.equal(result.total_count, 1);
   assert.equal(result.jobs.length, 1);
   assert.equal(result.jobs[0].id, "job-corrected");
+  assert.equal(result.jobs[0].has_corrections, true);
+});
+
+test("corrected job filter discovers jobs from model-first prefixes", async () => {
+  resetCachesForTests();
+  const modified = new Date("2026-09-29T08:00:00.000Z");
+  const responseKey = "jobs/job-model-first/response.json";
+  const sourceKey = "storage/uploads/model-first.mp4";
+  const s3 = {
+    async send(command) {
+      const { Key, Prefix } = command.input;
+      if (command.constructor.name === "ListObjectsV2Command") {
+        if (Prefix === "manual-annotations/") {
+          return {
+            CommonPrefixes: [{ Prefix: "manual-annotations/models/" }],
+            IsTruncated: false,
+          };
+        }
+        if (Prefix === "manual-annotations/models/") {
+          return {
+            CommonPrefixes: [
+              { Prefix: "manual-annotations/models/people-count/" },
+            ],
+            IsTruncated: false,
+          };
+        }
+        if (Prefix === "manual-annotations/models/people-count/") {
+          return {
+            CommonPrefixes: [
+              {
+                Prefix:
+                  "manual-annotations/models/people-count/job-model-first/",
+              },
+            ],
+            IsTruncated: false,
+          };
+        }
+        if (Prefix === "jobs/") {
+          return {
+            Contents: [{ Key: responseKey, LastModified: modified }],
+            IsTruncated: false,
+          };
+        }
+        return { Contents: [], CommonPrefixes: [], IsTruncated: false };
+      }
+      if (command.constructor.name === "GetObjectCommand" && Key === responseKey) {
+        const data = Buffer.from(
+          JSON.stringify({ status: "COMPLETED", source_key: sourceKey, results: [] }),
+        );
+        return {
+          Body: {
+            async transformToByteArray() {
+              return data;
+            },
+          },
+        };
+      }
+      if (command.constructor.name === "HeadObjectCommand" && Key === sourceKey) {
+        return { ETag: '"source"' };
+      }
+      throw missingError();
+    },
+  };
+
+  const result = await getJobs(
+    { range: "all", limit: 25, filter: "corrected" },
+    { s3 },
+  );
+  assert.equal(result.jobs.length, 1);
+  assert.equal(result.jobs[0].id, "job-model-first");
   assert.equal(result.jobs[0].has_corrections, true);
 });
 

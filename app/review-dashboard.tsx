@@ -51,6 +51,7 @@ import {
   Segment,
 } from "./api";
 import { adjacentFrame, frameWindow, mergeFrameNumbers } from "./frame-filter.mjs";
+import { visibleModelLayers } from "./model-layers.mjs";
 import { ReviewerBadge } from "./reviewer-identity";
 
 type VisibleModel = FrameModel & { visible: boolean };
@@ -144,6 +145,7 @@ export function ReviewDashboard({
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [activeModel, setActiveModel] = useState("");
+  const [expandedModelJobId, setExpandedModelJobId] = useState("");
   const [dirtyModels, setDirtyModels] = useState<Set<string>>(new Set());
   const [drafts, setDrafts] = useState<Record<string, FrameDraft>>({});
   const [pendingNavigation, setPendingNavigation] =
@@ -199,6 +201,17 @@ export function ReviewDashboard({
   const selected = annotations.find((item) => item.id === selectedId);
   const activeLayer =
     models.find((model) => model.id === activeModel) ?? models[0];
+  const showAllModelLayers = expandedModelJobId === job.id;
+  const displayedModels = useMemo<VisibleModel[]>(
+    () =>
+      visibleModelLayers(
+        models,
+        showAllModelLayers,
+        activeModel,
+        dirtyModels,
+      ),
+    [models, showAllModelLayers, activeModel, dirtyModels],
+  );
   const visibleModelIds = useMemo(
     () =>
       new Set(models.filter((model) => model.visible).map((model) => model.id)),
@@ -662,11 +675,11 @@ export function ReviewDashboard({
     );
   }
 
-  function showAllModels() {
-    models.forEach((model) => {
-      visibilityRef.current[model.id] = true;
-    });
-    setModels((items) => items.map((item) => ({ ...item, visible: true })));
+  function selectModelLayer(id: string) {
+    setActiveModel(id);
+    setSelectedId(
+      annotations.find((annotation) => annotation.model_id === id)?.id ?? "",
+    );
   }
 
   function updateSelected(patch: Partial<Annotation>) {
@@ -1125,7 +1138,7 @@ export function ReviewDashboard({
           ([frameNumber]) => !successfulFrames.has(Number(frameNumber)),
         ),
       );
-      const nextDetail = detail
+      const nextDetail: JobDetail | null = detail
         ? {
             ...detail,
             reviewed_frames: [
@@ -1149,6 +1162,10 @@ export function ReviewDashboard({
                   if (model.kind === "segment")
                     return {
                       ...model,
+                      source:
+                        model.source === "model_output"
+                          ? model.source
+                          : "manual_saved",
                       count: draft.segments.length,
                       segments: draft.segments,
                       segment: draft.segments[0] ?? null,
@@ -1158,6 +1175,10 @@ export function ReviewDashboard({
                   );
                   return {
                     ...model,
+                    source:
+                      model.source === "model_output"
+                        ? model.source
+                        : "manual_saved",
                     annotations: modelAnnotations,
                     count: modelAnnotations.length,
                     people_count:
@@ -2037,12 +2058,25 @@ export function ReviewDashboard({
                       <p className="eyebrow">Live layers</p>
                       <h3>Model layers on this frame</h3>
                     </div>
-                    <button className="text-button" onClick={showAllModels}>
-                      Show all
+                    <button
+                      className="text-button"
+                      onClick={() =>
+                        setExpandedModelJobId((current) =>
+                          current === job.id ? "" : job.id,
+                        )
+                      }
+                      aria-expanded={showAllModelLayers}
+                      title={
+                        showAllModelLayers
+                          ? "Hide models that are unused on this job"
+                          : "Show every model available for manual annotation"
+                      }
+                    >
+                      {showAllModelLayers ? "Hide unused" : "Show all models"}
                     </button>
                   </div>
                   <div className="model-list">
-                    {models.map((model) => {
+                    {displayedModels.map((model) => {
                       const layerAnnotations = annotations.filter(
                         (annotation) => annotation.model_id === model.id,
                       );
@@ -2060,7 +2094,7 @@ export function ReviewDashboard({
                         >
                           <button
                             className="model-select"
-                            onClick={() => setActiveModel(model.id)}
+                            onClick={() => selectModelLayer(model.id)}
                           >
                             <span
                               className="model-dot"
@@ -2069,7 +2103,9 @@ export function ReviewDashboard({
                             <span className="model-copy">
                               <strong>{model.name}</strong>
                               <small>
-                                {model.status === "SUCCESS"
+                                {model.source === "manual_available"
+                                  ? `Available for manual review · ${semanticSummary}`
+                                  : model.status === "SUCCESS"
                                   ? semanticSummary
                                   : `Manual only · ${semanticSummary}`}
                               </small>
