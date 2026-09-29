@@ -11,6 +11,8 @@
     "start": "next start",
     "test": "npm run build && node --test tests/*.test.mjs server/*.test.mjs",
     "test:routes": "node --test server/*.test.mjs",
+    "annotations:migrate": "node server/scripts/migrate-model-annotations.mjs",
+    "annotations:migrate:apply": "node server/scripts/migrate-model-annotations.mjs --apply",
     "test-job:create": "node server/scripts/dummy-s3-job.mjs create",
     "test-job:replace": "node server/scripts/dummy-s3-job.mjs create --replace",
     "test-job:delete": "node server/scripts/dummy-s3-job.mjs delete",

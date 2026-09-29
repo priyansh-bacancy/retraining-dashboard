@@ -18,6 +18,19 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import ffmpegPath from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
 
+import {
+  MANUAL_ROOT,
+  MODEL_ROOT,
+  RESERVED_LEGACY_NAMES,
+  legacyImageKey,
+  legacyLabelKey,
+  legacyMetadataKey,
+  modelLabelKey,
+  modelManifestKey,
+  modelMetadataKey,
+  sharedImageKey,
+} from "./annotation-storage.mjs";
+
 export const BUCKET =
   process.env.RETRAINING_BUCKET ??
   "icu-solarcam-storage-bacancy-ap-southeast-2";
@@ -30,6 +43,14 @@ const CACHE_ROOT = join(
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const FFMPEG = ffmpegPath;
 const FFPROBE = ffprobeStatic.path;
+
+function legacyAnnotationReadsEnabled() {
+  return process.env.ANNOTATION_LEGACY_READ !== "false";
+}
+
+function legacyAnnotationWritesEnabled() {
+  return process.env.ANNOTATION_LEGACY_WRITE !== "false";
+}
 
 const CLASS_NAMES = {
   "phone-usage-detection": ["in_hand", "on_ear"],
@@ -53,8 +74,15 @@ const CLASS_NAMES = {
 
 const MODEL_NAMES = {
   "ppe-compliance": "PPE compliance",
+  "running-detection": "Running detection",
+  "climb-detection": "Climb detection",
   "sleep-detection": "Sleep detection",
   "phone-usage-detection": "Phone usage",
+  "fire-smoke-detection": "Fire smoke detection",
+  "fall-detection": "Fall detection",
+  "restricted-zone": "Restricted zone",
+  "people-count": "People count",
+  "group-detection": "Group detection",
   "mmc-vehicle-classification": "Vehicle classification",
   "videomae-aggression": "Aggression",
 };
@@ -63,9 +91,31 @@ const MODEL_COLORS = {
   "ppe-compliance": "#f59e0b",
   "sleep-detection": "#8b5cf6",
   "phone-usage-detection": "#e8546b",
+  "fire-smoke-detection": "#64748b",
+  "fall-detection": "#64748b",
+  "running-detection": "#64748b",
+  "climb-detection": "#64748b",
+  "restricted-zone": "#64748b",
+  "people-count": "#64748b",
+  "group-detection": "#64748b",
   "mmc-vehicle-classification": "#16a89a",
   "videomae-aggression": "#ef4444",
 };
+
+const MANUAL_MODEL_IDS = [
+  "ppe-compliance",
+  "running-detection",
+  "climb-detection",
+  "phone-usage-detection",
+  "sleep-detection",
+  "videomae-aggression",
+  "fall-detection",
+  "restricted-zone",
+  "mmc-vehicle-classification",
+  "fire-smoke-detection",
+  "people-count",
+  "group-detection",
+];
 
 class HttpError extends Error {
   constructor(statusCode, message) {
@@ -182,29 +232,53 @@ async function listKeys(s3, prefix) {
   return rows;
 }
 
-async function loadCorrectedJobIds(s3) {
-  if (fresh(cache.correctedJobs)) return cache.correctedJobs.value;
-  const jobIds = new Set();
+async function listPrefixes(s3, prefix) {
+  const prefixes = [];
   let continuationToken;
   do {
     const response = await s3.send(
       new ListObjectsV2Command({
         Bucket: BUCKET,
-        Prefix: "manual-annotations/",
+        Prefix: prefix,
         Delimiter: "/",
         ContinuationToken: continuationToken,
       }),
     );
-    for (const row of response.CommonPrefixes ?? []) {
-      const match = /^manual-annotations\/([^/]+)\/$/.exec(
-        String(row.Prefix ?? ""),
-      );
-      if (match && SAFE_ID.test(match[1])) jobIds.add(match[1]);
-    }
+    prefixes.push(
+      ...(response.CommonPrefixes ?? [])
+        .map((row) => String(row.Prefix ?? ""))
+        .filter(Boolean),
+    );
     continuationToken = response.IsTruncated
       ? response.NextContinuationToken
       : undefined;
   } while (continuationToken);
+  return prefixes;
+}
+
+async function loadCorrectedJobIds(s3) {
+  if (fresh(cache.correctedJobs)) return cache.correctedJobs.value;
+  const jobIds = new Set();
+  if (legacyAnnotationReadsEnabled()) {
+    for (const prefix of await listPrefixes(s3, `${MANUAL_ROOT}/`)) {
+      const match = /^manual-annotations\/([^/]+)\/$/.exec(prefix);
+      if (
+        match &&
+        !RESERVED_LEGACY_NAMES.has(match[1]) &&
+        SAFE_ID.test(match[1])
+      ) {
+        jobIds.add(match[1]);
+      }
+    }
+  }
+  for (const modelPrefix of await listPrefixes(s3, `${MODEL_ROOT}/`)) {
+    for (const jobPrefix of await listPrefixes(s3, modelPrefix)) {
+      const match = /^manual-annotations\/models\/[^/]+\/([^/]+)\/$/.exec(
+        jobPrefix,
+      );
+      if (match && SAFE_ID.test(match[1])) jobIds.add(match[1]);
+    }
+  }
   cache.correctedJobs = { at: Date.now(), value: jobIds };
   return jobIds;
 }
@@ -287,6 +361,20 @@ function shortName(modelId) {
   if (modelId === "sleep-detection") return "Sleep";
   if (modelId.includes("aggression")) return "Aggression";
   return modelId.split("-")[0]?.replace(/^./, (value) => value.toUpperCase());
+}
+
+export function manualModelCatalog() {
+  return MANUAL_MODEL_IDS.map((modelId) => ({
+    id: modelId,
+    name:
+      MODEL_NAMES[modelId] ??
+      modelId.replaceAll("-", " ").replace(/\b\w/g, (value) => value.toUpperCase()),
+    short: shortName(modelId),
+    color: MODEL_COLORS[modelId] ?? "#64748b",
+    kind: resultKind(modelId),
+    classes: CLASS_NAMES[modelId] ?? ["aggression"],
+    manual_enabled: true,
+  }));
 }
 
 function humanAge(modified) {
@@ -483,24 +571,26 @@ async function loadJob(s3, jobId) {
   return response;
 }
 
-async function buildLabelIndex(s3, jobId) {
+async function buildLabelIndex(s3, jobId, modelIds = []) {
   const index = new Map();
   const priorities = new Map();
   const roots = [
     ["training", false, 1],
     ["prelabels", false, 2],
-    ["manual-annotations", true, 3],
+    ...(legacyAnnotationReadsEnabled()
+      ? [["legacy-manual", true, 3]]
+      : []),
   ];
   for (const [root, manual, priority] of roots) {
     const prefix =
-      root === "manual-annotations"
-        ? `manual-annotations/${jobId}/labels/`
+      root === "legacy-manual"
+        ? `${MANUAL_ROOT}/${jobId}/labels/`
         : `${root}/${jobId}/`;
     for (const row of await listKeys(s3, prefix)) {
       const match = /frame_(\d+)\.txt$/.exec(String(row.Key ?? ""));
       if (!match) continue;
       const parts = row.Key.split("/");
-      const modelId = root === "manual-annotations" ? parts[3] : parts[2];
+      const modelId = root === "legacy-manual" ? parts[3] : parts[2];
       if (!modelId) continue;
       const frame = Number(match[1]);
       const mapKey = `${modelId}\0${frame}`;
@@ -508,6 +598,22 @@ async function buildLabelIndex(s3, jobId) {
         priorities.set(mapKey, priority);
         index.set(mapKey, { key: row.Key, manual, modelId, frame });
       }
+    }
+  }
+  for (const modelId of [...new Set(modelIds)].filter((id) => SAFE_ID.test(id))) {
+    const prefix = `${MODEL_ROOT}/${modelId}/${jobId}/labels/`;
+    for (const row of await listKeys(s3, prefix)) {
+      const match = /frame_(\d+)\.txt$/.exec(String(row.Key ?? ""));
+      if (!match) continue;
+      const frame = Number(match[1]);
+      const mapKey = `${modelId}\0${frame}`;
+      priorities.set(mapKey, 4);
+      index.set(mapKey, {
+        key: row.Key,
+        manual: true,
+        modelId,
+        frame,
+      });
     }
   }
   return index;
@@ -828,10 +934,11 @@ async function labelBytes(s3, labelIndex, modelId, frame) {
 }
 
 async function manualMetadata(s3, jobId, modelId, frame) {
-  const raw = await tryBytes(
-    s3,
-    `manual-annotations/${jobId}/metadata/${modelId}/frame_${String(frame).padStart(6, "0")}.json`,
-  );
+  const raw =
+    (await tryBytes(s3, modelMetadataKey(modelId, jobId, frame))) ??
+    (legacyAnnotationReadsEnabled()
+      ? await tryBytes(s3, legacyMetadataKey(jobId, modelId, frame))
+      : null);
   if (!raw) return null;
   try {
     const value = JSON.parse(raw.toString("utf8"));
@@ -925,8 +1032,29 @@ function segmentsForFrame(result, frame, fps) {
 
 export async function frameReview(s3, frame, response, metadata, labelIndex) {
   const models = [];
-  for (const result of response.results ?? []) {
-    const modelId = String(result.model_id);
+  const outputResults = response.results ?? [];
+  const resultsById = new Map(
+    outputResults.map((result) => [String(result.model_id), result]),
+  );
+  const catalog = manualModelCatalog();
+  const catalogById = new Map(catalog.map((model) => [model.id, model]));
+  const manualModelIds = new Set(
+    [...labelIndex.values()]
+      .filter((item) => item.manual)
+      .map((item) => item.modelId),
+  );
+  const modelIds = [
+    ...resultsById.keys(),
+    ...catalog.map((model) => model.id).filter((id) => !resultsById.has(id)),
+  ];
+  for (const modelId of modelIds) {
+    const outputResult = resultsById.get(modelId);
+    const result = outputResult ?? {
+      model_id: modelId,
+      status: "MANUAL_ONLY",
+      detections: [],
+    };
+    const definition = catalogById.get(modelId);
     const kind = resultKind(modelId);
     let annotations = [];
     let segments = [];
@@ -959,7 +1087,7 @@ export async function frameReview(s3, frame, response, metadata, labelIndex) {
       if (rich.length && !storedLabel.manual) annotations = rich;
     }
     const classes = [
-      ...(CLASS_NAMES[modelId] ?? []),
+      ...(definition?.classes ?? CLASS_NAMES[modelId] ?? []),
       ...(result.detections ?? []).map((detection) => String(detection.label)).filter(Boolean),
       ...annotations.map((annotation) => String(annotation.label)).filter(Boolean),
     ].filter((value, index, values) => values.indexOf(value) === index);
@@ -968,11 +1096,19 @@ export async function frameReview(s3, frame, response, metadata, labelIndex) {
       .filter(Number.isFinite);
     models.push({
       id: modelId,
-      name: MODEL_NAMES[modelId] ?? modelId.replaceAll("-", " ").replace(/\b\w/g, (value) => value.toUpperCase()),
-      short: shortName(modelId),
-      color: MODEL_COLORS[modelId] ?? "#64748b",
+      name:
+        definition?.name ??
+        MODEL_NAMES[modelId] ??
+        modelId.replaceAll("-", " ").replace(/\b\w/g, (value) => value.toUpperCase()),
+      short: definition?.short ?? shortName(modelId),
+      color: definition?.color ?? MODEL_COLORS[modelId] ?? "#64748b",
       kind,
       status: result.status,
+      source: outputResult
+        ? "model_output"
+        : manualModelIds.has(modelId)
+          ? "manual_saved"
+          : "manual_available",
       annotations,
       segments,
       segment: segments[0] ?? null,
@@ -1014,6 +1150,9 @@ function numberInRange(value, minimum, maximum, label) {
 
 function normalizeCorrection(correction) {
   const modelId = validateId(correction?.model_id, "model ID");
+  if (!MANUAL_MODEL_IDS.includes(modelId)) {
+    throw new HttpError(422, `Model '${modelId}' is not available for manual annotation`);
+  }
   const annotations = Array.isArray(correction?.annotations)
     ? correction.annotations.map((item, index) => ({
         id: String(item.id ?? `${modelId}-${index}`),
@@ -1061,10 +1200,118 @@ function normalizeCorrection(correction) {
   return { modelId, annotations, segments, peopleCount };
 }
 
+async function optionalJson(s3, key) {
+  const raw = await tryBytes(s3, key);
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw.toString("utf8"));
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function correctionReviewStatus(correction) {
+  if (
+    correction.annotations.length === 0 &&
+    correction.segments.length === 0 &&
+    (!Number.isInteger(correction.peopleCount) || correction.peopleCount === 0)
+  ) {
+    return "reviewed_empty";
+  }
+  return "corrected";
+}
+
+async function updateModelManifest(
+  s3,
+  jobId,
+  frameNumber,
+  correction,
+  updatedAt,
+) {
+  const key = modelManifestKey(correction.modelId, jobId);
+  const existing = (await optionalJson(s3, key)) ?? {};
+  const manifest = {
+    schema_version: 2,
+    model_id: correction.modelId,
+    job_id: jobId,
+    updated_at: updatedAt,
+    frames: {
+      ...(existing.frames && typeof existing.frames === "object"
+        ? existing.frames
+        : {}),
+      [String(frameNumber)]: {
+        frame_number: frameNumber,
+        review_status: correctionReviewStatus(correction),
+        image_key: sharedImageKey(jobId, frameNumber),
+        label_key: modelLabelKey(correction.modelId, jobId, frameNumber),
+        metadata_key: modelMetadataKey(correction.modelId, jobId, frameNumber),
+        updated_at: updatedAt,
+      },
+    },
+  };
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: key,
+      Body: JSON.stringify(manifest),
+      ContentType: "application/json",
+    }),
+  );
+  return key;
+}
+
+async function ensureDualFrameImage(s3, jobId, frameNumber) {
+  const currentKey = sharedImageKey(jobId, frameNumber);
+  const legacyKey = legacyImageKey(jobId, frameNumber);
+  const shouldReadLegacy = legacyAnnotationReadsEnabled();
+  const shouldWriteLegacy = legacyAnnotationWritesEnabled();
+  const currentExists = await objectExists(s3, currentKey);
+  const legacyExists =
+    shouldReadLegacy || shouldWriteLegacy
+      ? await objectExists(s3, legacyKey)
+      : false;
+  if (currentExists && (!shouldWriteLegacy || legacyExists)) {
+    return shouldWriteLegacy ? [currentKey, legacyKey] : [currentKey];
+  }
+  const currentBytes = currentExists ? await tryBytes(s3, currentKey) : null;
+  const legacyBytes =
+    shouldReadLegacy && legacyExists ? await tryBytes(s3, legacyKey) : null;
+  const body =
+    currentBytes ??
+    legacyBytes ??
+    (await extractFrame(s3, jobId, frameNumber));
+  if (!currentExists) {
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: BUCKET,
+        Key: currentKey,
+        Body: body,
+        ContentType: "image/jpeg",
+      }),
+    );
+  }
+  if (shouldWriteLegacy && !legacyExists) {
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: BUCKET,
+        Key: legacyKey,
+        Body: body,
+        ContentType: "image/jpeg",
+      }),
+    );
+  }
+  return shouldWriteLegacy ? [currentKey, legacyKey] : [currentKey];
+}
+
 export async function writeFrameCorrections(s3, jobId, frameNumber, corrections) {
+  if (!Array.isArray(corrections) || corrections.length === 0) return [];
+  const normalizedCorrections = corrections.map(normalizeCorrection);
   const written = [];
-  for (const rawCorrection of corrections) {
-    const correction = normalizeCorrection(rawCorrection);
+  written.push(...(await ensureDualFrameImage(s3, jobId, frameNumber)));
+  for (const correction of normalizedCorrections) {
     const lines = correction.annotations.map((item) => {
       const classId = validatedClassId(
         correction.modelId,
@@ -1075,52 +1322,77 @@ export async function writeFrameCorrections(s3, jobId, frameNumber, corrections)
       const centerY = (item.y + item.height / 2) / 100;
       return `${classId} ${centerX.toFixed(6)} ${centerY.toFixed(6)} ${(item.width / 100).toFixed(6)} ${(item.height / 100).toFixed(6)}`;
     });
-    const fileName = `frame_${String(frameNumber).padStart(6, "0")}`;
-    const labelKey = `manual-annotations/${jobId}/labels/${correction.modelId}/${fileName}.txt`;
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: BUCKET,
-        Key: labelKey,
-        Body: lines.length ? `${lines.join("\n")}\n` : "",
-        ContentType: "text/plain",
-      }),
+    const labelBody = lines.length ? `${lines.join("\n")}\n` : "";
+    const currentLabelKey = modelLabelKey(
+      correction.modelId,
+      jobId,
+      frameNumber,
     );
-    written.push(labelKey);
-    const metadataKey = `manual-annotations/${jobId}/metadata/${correction.modelId}/${fileName}.json`;
+    const oldLabelKey = legacyLabelKey(jobId, correction.modelId, frameNumber);
+    const labelKeys = legacyAnnotationWritesEnabled()
+      ? [currentLabelKey, oldLabelKey]
+      : [currentLabelKey];
+    for (const key of labelKeys) {
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: BUCKET,
+          Key: key,
+          Body: labelBody,
+          ContentType: "text/plain",
+        }),
+      );
+      written.push(key);
+    }
+    const updatedAt = new Date().toISOString();
     const metadata = {
-      version: 1,
+      version: 2,
+      schema_version: 2,
+      job_id: jobId,
       model_id: correction.modelId,
       kind: resultKind(correction.modelId),
       frame_number: frameNumber,
+      image_key: sharedImageKey(jobId, frameNumber),
+      review_status: correctionReviewStatus(correction),
+      reviewer: reviewerIdentity(),
       annotations: correction.annotations,
       people_count: correction.peopleCount,
       segments: correction.segments,
       segment: correction.segments[0] ?? null,
-      updated_at: new Date().toISOString(),
+      updated_at: updatedAt,
     };
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: BUCKET,
-        Key: metadataKey,
-        Body: JSON.stringify(metadata),
-        ContentType: "application/json",
-      }),
+    const currentMetadataKey = modelMetadataKey(
+      correction.modelId,
+      jobId,
+      frameNumber,
     );
-    written.push(metadataKey);
-  }
-  if (written.length) {
-    const imageKey = `manual-annotations/${jobId}/images/frame_${String(frameNumber).padStart(6, "0")}.jpg`;
-    if (!(await tryBytes(s3, imageKey))) {
+    const oldMetadataKey = legacyMetadataKey(
+      jobId,
+      correction.modelId,
+      frameNumber,
+    );
+    const metadataKeys = legacyAnnotationWritesEnabled()
+      ? [currentMetadataKey, oldMetadataKey]
+      : [currentMetadataKey];
+    for (const key of metadataKeys) {
       await s3.send(
         new PutObjectCommand({
           Bucket: BUCKET,
-          Key: imageKey,
-          Body: await extractFrame(s3, jobId, frameNumber),
-          ContentType: "image/jpeg",
+          Key: key,
+          Body: JSON.stringify(metadata),
+          ContentType: "application/json",
         }),
       );
+      written.push(key);
     }
-    written.unshift(imageKey);
+    written.push(
+      await updateModelManifest(
+        s3,
+        jobId,
+        frameNumber,
+        correction,
+        updatedAt,
+      ),
+    );
   }
   return written;
 }
@@ -1346,7 +1618,16 @@ export async function getJobDetail(jobIdValue, query = {}, { s3 = defaultClients
     }
     const response = await loadJob(s3, jobId);
     const metadata = await videoMetadata(s3, jobId, response.source_key);
-    const labels = await buildLabelIndex(s3, jobId);
+    const labels = await buildLabelIndex(
+      s3,
+      jobId,
+      [
+        ...(response.results ?? []).map((result) =>
+          String(result.model_id ?? ""),
+        ),
+        ...manualModelCatalog().map((model) => model.id),
+      ],
+    );
     const numbers = completeFrameNumbers(response, labels, metadata.frame_count);
     const selection = selectRequestedBatch(numbers, batch, size, query.frame);
     const { selected, totalBatches } = selection;
@@ -1369,6 +1650,7 @@ export async function getJobDetail(jobIdValue, query = {}, { s3 = defaultClients
       reviewed_frames: reviewedFrames,
       batch_size: size,
       total_batches: totalBatches,
+      available_models: manualModelCatalog(),
       frames: await mapLimit(selected, 6, (frame) =>
         frameReview(s3, frame, response, metadata, labels),
       ),
@@ -1457,17 +1739,23 @@ export async function getFrameImage(jobIdValue, frameNumberValue, { s3 = default
     if (!Number.isInteger(frameNumber) || frameNumber < 0) {
       throw new HttpError(400, "Invalid frame number");
     }
-    const savedKey = `manual-annotations/${jobId}/images/frame_${String(frameNumber).padStart(6, "0")}.jpg`;
-    try {
-      await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: savedKey }));
-      const url = await getSignedUrl(
-        s3,
-        new GetObjectCommand({ Bucket: BUCKET, Key: savedKey }),
-        { expiresIn: 300 },
-      );
-      return { redirectUrl: url, data: null };
-    } catch (error) {
-      if (!isMissing(error)) throw error;
+    for (const savedKey of [
+      sharedImageKey(jobId, frameNumber),
+      ...(legacyAnnotationReadsEnabled()
+        ? [legacyImageKey(jobId, frameNumber)]
+        : []),
+    ]) {
+      try {
+        await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: savedKey }));
+        const url = await getSignedUrl(
+          s3,
+          new GetObjectCommand({ Bucket: BUCKET, Key: savedKey }),
+          { expiresIn: 300 },
+        );
+        return { redirectUrl: url, data: null };
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+      }
     }
     return { redirectUrl: null, data: await extractFrame(s3, jobId, frameNumber) };
 }

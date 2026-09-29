@@ -60,6 +60,7 @@ export type FrameModel = {
   color: string;
   kind: "box" | "vehicle" | "segment" | "people" | "group";
   status: string;
+  source: "model_output" | "manual_saved" | "manual_available";
   classes: string[];
   annotations: Annotation[];
   segments: Segment[];
@@ -92,6 +93,11 @@ export type JobDetail = {
   batch_size: number;
   total_batches: number;
   frames: FrameReview[];
+  available_models: Array<
+    Pick<FrameModel, "id" | "name" | "short" | "color" | "kind" | "classes"> & {
+      manual_enabled: boolean;
+    }
+  >;
   failed_models: { id: string; error: string }[];
 };
 

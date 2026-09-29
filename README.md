@@ -10,7 +10,8 @@ The UI and server functionality run in one Next.js application on port 3000. Nex
 - merge original model labels with saved manual overrides;
 - inspect source-video metadata and extract requested frames with bundled FFmpeg;
 - expose temporary preview URLs;
-- save clean frames and complete corrected label files under `manual-annotations/`;
+- save clean frames and complete corrected label files under a model-first
+  `manual-annotations/models/{model_id}/{job_id}/` layout;
 - preserve MMC track attributes and multiple Aggression time segments.
 
 Jobs remain manually reviewable when model inference fails. The server resolves
@@ -65,7 +66,33 @@ npm run test-job:delete
 ## Correction behavior
 
 - The original machine-generated labels are read-only.
-- Only frames/models changed by the reviewer are written under `manual-annotations/{job_id}/`.
+- New corrections are written model-first under
+  `manual-annotations/models/{model_id}/{job_id}/`, with shared clean images
+  under `manual-annotations/images/{job_id}/`.
+- During migration, writes are mirrored to the legacy
+  `manual-annotations/{job_id}/` paths and reads fall back to those paths.
 - A changed model is saved as its complete final label file, not as one individual box delta.
 - Deleting every detection writes an empty override, so reopening does not restore the original detection.
 - Reopening a job shows the complete sampled-frame set and applies manual overrides only where they exist.
+
+## Model-first S3 migration
+
+Preview the non-destructive migration of existing annotations:
+
+```bash
+npm run annotations:migrate
+```
+
+After reviewing the object and manifest counts, apply and verify the migration:
+
+```bash
+npm run annotations:migrate:apply
+```
+
+The migration never deletes legacy objects. Keep the legacy paths until the
+new structure has been validated in production and a separate, approved
+retirement process has completed.
+
+Use `ANNOTATION_LEGACY_READ=true` and `ANNOTATION_LEGACY_WRITE=true` during
+migration. After verification, disable legacy writes first. Disable legacy
+reads only after the old objects have been independently backed up and retired.
