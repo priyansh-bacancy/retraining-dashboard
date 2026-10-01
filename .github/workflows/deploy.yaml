@@ -1,0 +1,53 @@
+name: Deploy Retraining Dashboard
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    environment: main
+
+    steps:
+      - name: Deploy application to EC2
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+
+            echo "======================================"
+            echo "Starting Retraining Dashboard deployment"
+            echo "======================================"
+
+            cd ~/retraining-dashboard
+
+            echo "Switching to main branch..."
+            git switch main
+
+            echo "Pulling latest changes..."
+            git pull origin main
+
+            echo "Installing dependencies..."
+            npm ci
+
+            echo "Building application..."
+            npm run build
+
+            echo "Restarting systemd service..."
+            sudo systemctl restart icu-retraining-dashboard.service
+
+            echo "Checking service status..."
+            sudo systemctl status icu-retraining-dashboard.service --no-pager
+
+            echo "======================================"
+            echo "Deployment completed successfully"
+            echo "======================================"
