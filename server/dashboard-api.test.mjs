@@ -6,6 +6,7 @@ import {
   completeFrameNumbers,
   decodePageCursor,
   encodePageCursor,
+  findPreviewKey,
   getHealth,
   getJobs,
   frameReview,
@@ -27,6 +28,47 @@ import {
   modelMetadataKey,
   sharedImageKey,
 } from "./annotation-storage.mjs";
+
+test("preview selection supports multi-snapshot and legacy model responses", () => {
+  assert.equal(
+    findPreviewKey([
+      {
+        status: "SUCCESS",
+        output_media: {
+          annotated_image_s3_keys: [
+            "jobs/job-1/phone-usage-detection/frame_1.jpg",
+            "jobs/job-1/phone-usage-detection/frame_2.jpg",
+          ],
+          annotated_image_s3_key: "jobs/job-1/phone-usage-detection/best_frame.jpg",
+        },
+      },
+    ]),
+    "jobs/job-1/phone-usage-detection/frame_1.jpg",
+  );
+  assert.equal(
+    findPreviewKey([
+      {
+        status: "SUCCESS",
+        output_media: {
+          annotated_image_s3_keys: [],
+          annotated_image_s3_key: "jobs/job-2/sleep-detection/best_frame.jpg",
+        },
+      },
+    ]),
+    "jobs/job-2/sleep-detection/best_frame.jpg",
+  );
+  assert.equal(
+    findPreviewKey([
+      {
+        status: "FAILED",
+        output_media: {
+          annotated_image_s3_keys: ["jobs/job-3/frame_1.jpg"],
+        },
+      },
+    ]),
+    null,
+  );
+});
 
 function missingError() {
   const error = new Error("missing");

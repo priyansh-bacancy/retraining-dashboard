@@ -450,11 +450,19 @@ function failureSummary(results) {
   return "One or more model executions failed";
 }
 
-function findPreviewKey(results) {
+export function findPreviewKey(results) {
   for (const result of results) {
     if (result.status !== "SUCCESS") continue;
-    const key = result.output_media?.annotated_image_s3_key;
-    if (key) return String(key);
+    const media = result.output_media;
+    const snapshotKeys = Array.isArray(media?.annotated_image_s3_keys)
+      ? media.annotated_image_s3_keys
+      : [];
+    const snapshotKey = snapshotKeys.find((key) =>
+      typeof key === "string" && key.trim(),
+    );
+    if (snapshotKey) return snapshotKey;
+    const legacyKey = media?.annotated_image_s3_key;
+    if (legacyKey) return String(legacyKey);
   }
   return null;
 }
